@@ -33,10 +33,16 @@ def main():
 
     for idx, p in enumerate(paths, start=1):
         print(f"Loading {p} as subject {idx}")
-        data = torch.load(p)
+        # Try loading the file; if it's unreadable/corrupt, skip with a warning
+        try:
+            data = torch.load(p, map_location='cpu')
+        except Exception as e:
+            print(f"Warning: Could not open {p}: {e}. Skipping this file.")
+            continue
         ds = data.get("dataset", None)
         if ds is None:
-            raise SystemExit(f"File {p} does not contain 'dataset' key")
+            print(f"Warning: File {p} does not contain 'dataset' key. Skipping.")
+            continue
         for sample in ds:
             sample["subject"] = idx
             combined_dataset.append(sample)

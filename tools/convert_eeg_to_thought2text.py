@@ -207,8 +207,21 @@ def main():
 
     print(f"Created {sample_count} samples. Saving to {args.output}")
     out = {"dataset": dataset_list, "labels": labels_list, "images": images_list}
-    torch.save(out, args.output)
-    print("Saved output successfully.")
+    # Write atomically: save to a temporary file then replace the final path
+    tmp_output = args.output + ".tmp"
+    try:
+        torch.save(out, tmp_output)
+        # Use os.replace for atomic rename across platforms
+        os.replace(tmp_output, args.output)
+        print("Saved output successfully.")
+    except Exception as e:
+        # Clean up temp file if present
+        try:
+            if os.path.exists(tmp_output):
+                os.remove(tmp_output)
+        except Exception:
+            pass
+        raise
 
 
 if __name__ == "__main__":
