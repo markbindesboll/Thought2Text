@@ -104,6 +104,24 @@ def main():
         raise SystemExit("Could not find EEG data array in the input file. Expected key like 'preprocessed_eeg_data' or 'arr'.")
 
     eeg_arr = raw[eeg_key]
+    # If the located entry is a dict-like container, try to extract the array inside it
+    if isinstance(eeg_arr, dict):
+        nested = _find_key(eeg_arr, ["preprocessed_eeg_data", "preprocessed", "arr", "data", "eeg"]) or (list(eeg_arr.keys())[0] if len(eeg_arr) else None)
+        if nested is None:
+            raise SystemExit(f"Loaded EEG entry is a dict but contains no recognizable array keys. Keys: {list(eeg_arr.keys())}")
+        eeg_arr = eeg_arr[nested]
+
+    # Handle object arrays or 0-d arrays that wrap a dict/ndarray/tensor
+    if isinstance(eeg_arr, np.ndarray) and eeg_arr.dtype == object and eeg_arr.size == 1:
+        item = eeg_arr.item()
+        if isinstance(item, (np.ndarray, torch.Tensor)):
+            eeg_arr = item
+        elif isinstance(item, dict):
+            nested = _find_key(item, ["preprocessed_eeg_data", "preprocessed", "arr", "data", "eeg"]) or (list(item.keys())[0] if len(item) else None)
+            if nested is None:
+                raise SystemExit(f"Nested dict inside object-array has no recognizable keys. Keys: {list(item.keys())}")
+            eeg_arr = item[nested]
+
     # Ensure numpy array
     if isinstance(eeg_arr, torch.Tensor):
         eeg_arr = eeg_arr.cpu().numpy()
