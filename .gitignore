@@ -1,0 +1,7 @@
+# Exclude all files in the 'data' folder and the folder itself
+data/
+.vscode/
+
+
+# Optional: Exclude common temporary OS files
+*.log
