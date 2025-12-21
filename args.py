@@ -35,7 +35,7 @@ def get_args_for_encoder_training():
     parser.add_argument(
         "-sub",
         "--subject",
-        default=0,
+        default=1,
         type=int,
         help="choose a subject from 1 to 6, default is 0 (all subjects)",
     )
