@@ -24,7 +24,13 @@ def get_args_for_encoder_training():
         required=True,
         help="Directory to save the model checkpoints and logs.",
     )
-
+    parser.add_argument(
+        "--run_name",
+        type=str,
+        required=False,
+        default="eeg_encoder",
+        help="Run name for logging purposes.",
+    )
     parser.add_argument("--clip_model", default="openai/clip-vit-base-patch32")
 
     parser.add_argument(
@@ -35,7 +41,7 @@ def get_args_for_encoder_training():
     parser.add_argument(
         "-sub",
         "--subject",
-        default=1,
+        default=0,
         type=int,
         help="choose a subject from 1 to 6, default is 0 (all subjects)",
     )
@@ -77,7 +83,7 @@ def get_args_for_encoder_training():
     )
     parser.add_argument(
         "--optim",
-        default="adamw_hf",
+        default="adamw_torch",
         type=str,
         help="Optimizer to use for training.",
     )
@@ -141,6 +147,14 @@ def get_args_for_llm_finetuning():
         required=True,
         help="Directory to save the model checkpoints and logs.",
     )
+    parser.add_argument(
+        "--run_name",
+        type=str,
+        required=False,
+        default="llm_finetune",
+        help="Run name for logging/experiment tracking (wandb/tensorboard).",
+    )
+
     parser.add_argument(
         "--llm_backbone_name_or_path",
         type=str,
@@ -229,7 +243,7 @@ def get_args_for_llm_finetuning():
     )
     parser.add_argument(
         "--optim",
-        default="adamw_hf",
+        default="adamw_torch",
         type=str,
         help="Optimizer to use for training.",
     )

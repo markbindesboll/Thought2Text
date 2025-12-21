@@ -19,7 +19,7 @@ class EEGDataset:
     def __init__(self, args, fine_tuning=False):
         self.args = args
         # Load EEG signals
-        loaded = torch.load(args.eeg_dataset)
+        loaded = torch.load(args.eeg_dataset, weights_only=False)
         if args.subject != 0:
             self.data = [
                 loaded["dataset"][i]
@@ -28,8 +28,11 @@ class EEGDataset:
             ]
         else:
             self.data = loaded["dataset"]
+        
         self.labels = loaded["labels"]
         self.images = loaded["images"]
+        self.channels = loaded["channels"]
+        self.times = loaded["times"]
 
         # Compute size
         self.size = len(self.data)
@@ -45,26 +48,43 @@ class EEGDataset:
 
     # Get item
     def __getitem__(self, i):
+
         # Process EEG
-        eeg = self.data[i]["eeg"].float().t()
-        eeg = eeg[self.args.time_low : self.args.time_high, :]
-        eeg = eeg.t()
-        eeg = eeg.view(1, 128, self.args.time_high - self.args.time_low)
+        eeg = self.data[i]["eeg"].float()
+        #eeg = eeg[self.args.time_low : self.args.time_high, :]
+        #eeg = eeg.t()
+        eeg = eeg.view(1, len(self.channels), len(self.times))
         label = self.data[i]["label"]
+        label_string = self.labels[self.data[i]["image"]]
         image_name = self.images[self.data[i]["image"]]
-        image_path = os.path.join(
-            self.image_dir, image_name.split("_")[0], image_name + "_sketch.JPEG"
-        )
+        # Sanity check
+        # print("n_channels:", len(self.channels), "n_times:", len(self.times))
+        # print("times[0], times[-1]:", self.times[0], self.times[-1])
+        # print(self.data[i]["eeg"].shape)
+        # print("image_name:", image_name)
+        # print("ImageID:", self.data[i]["image"])
+        # print("label_string:", label_string)
+        # print("labelID:", label)
+        # print(i)
+
+
+        if label<1654:
+            image_path = os.path.join(
+                self.image_dir, "training_images",label_string, image_name
+            )
+        else:
+            image_path = os.path.join(
+                self.image_dir, "test_images",label_string, image_name
+            )
         image_raw = Image.open(image_path).convert("RGB")
 
         image_raw = self.processor(images=image_raw, return_tensors="pt", padding=True)
         image_raw["pixel_values"] = image_raw["pixel_values"].squeeze(0)
 
         if self.fine_tuning:
-            label_string = label_map[image_name.split("_")[0]]
             return image_raw, eeg, label_string
         else:
-            return image_raw, eeg, label
+            return image_raw, eeg, label # adjust label to be zero-indexed for Pytorch
 
 
 class Splitter:
@@ -75,14 +95,14 @@ class Splitter:
         # Set EEG dataset
         self.dataset = dataset
         # Load split
-        loaded = torch.load(split_path)
+        loaded = torch.load(split_path, weights_only=False)
         self.split_idx = loaded["splits"][split_num][split_name]
         # Filter data
-        self.split_idx = [
-            i
-            for i in self.split_idx
-            if 450 <= self.dataset.data[i]["eeg"].size(1) <= 600
-        ]
+        # self.split_idx = [
+        #     i
+        #     for i in self.split_idx
+        #     if 450 <= self.dataset.data[i]["eeg"].size(1) <= 600
+        # ]
         # Compute size
         self.size = len(self.split_idx)
         self.fine_tuning = fine_tuning
@@ -134,7 +154,7 @@ class EEGFineTuningDataset:
         
         
         # Load EEG signals
-        loaded = torch.load(args.eeg_dataset)
+        loaded = torch.load(args.eeg_dataset,weights_only=False)
         if args.subject != 0:
             self.data = [
                 loaded["dataset"][i]
@@ -145,6 +165,8 @@ class EEGFineTuningDataset:
             self.data = loaded["dataset"]
         self.labels = loaded["labels"]
         self.images = loaded["images"]
+        self.channels = loaded["channels"]
+        self.times = loaded["times"]
 
         # Compute size
         self.size = len(self.data)
@@ -160,18 +182,24 @@ class EEGFineTuningDataset:
 
     # Get item
     def __getitem__(self, i):
+
         # Process EEG
-        eeg = self.data[i]["eeg"].float().t()
-        eeg = eeg[self.args.time_low : self.args.time_high, :]
-        eeg = eeg.t()
-        eeg = eeg.view(1, 128, self.args.time_high - self.args.time_low)
+        eeg = self.data[i]["eeg"].float()
+        eeg = eeg.view(1, len(self.channels), len(self.times))
         label = self.data[i]["label"]
+        label_string = self.labels[label]
         # print(label)
         image_name = self.images[self.data[i]["image"]]
-        image_path = os.path.join(
-            self.image_dir, image_name.split("_")[0], image_name + "_sketch.JPEG"
-        )
-        label_string = label_map[image_name.split("_")[0]]
+
+        if label<1654:
+            image_path = os.path.join(
+                self.image_dir, "training_images",label_string, image_name
+            )
+        else:
+            image_path = os.path.join(
+                self.image_dir, "test_images",label_string, image_name
+            )
+
         self.id2label[label] = label_string
         caption_path = os.path.join(
             self.image_dir, image_name.split("_")[0], image_name + "_caption.txt"
@@ -222,7 +250,7 @@ class SplitterFineTuning:
         # f.dataset = dataset
         self.dataset = dataset
         # Load split
-        loaded = torch.load(split_path)
+        loaded = torch.load(split_path,weights_only=False)
         self.split_idx = loaded["splits"][split_num][split_name]
         # Filter data
         self.split_idx = [
@@ -283,7 +311,7 @@ class EEGInferenceDataset:
     def __init__(self, args):
         self.args = args
         # Load EEG signals
-        loaded = torch.load(args.eeg_dataset)
+        loaded = torch.load(args.eeg_dataset,weights_only=False)
         if args.subject != 0:
             self.data = [
                 loaded["dataset"][i]
@@ -334,7 +362,7 @@ class SplitterInference:
         # f.dataset = dataset
         self.dataset = dataset
         # Load split
-        loaded = torch.load(split_path)
+        loaded = torch.load(split_path,weights_only=False)
         self.split_idx = loaded["splits"][split_num][split_name]
         # Filter data
         self.split_idx = [

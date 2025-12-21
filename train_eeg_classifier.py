@@ -190,6 +190,8 @@ def main():
         load_best_model_at_end=True,
         save_strategy="epoch",
         eval_strategy="epoch",
+        run_name = args.run_name,
+        report_to="none"
     )
     trainer = EEGEncoderTrainer(
         model=model,
