@@ -115,12 +115,16 @@ class ChannelNetModel(PreTrainedModel):
         self.projector = nn.Linear(encoding_size, config.embedding_size)
         self.classifier = nn.Linear(config.embedding_size, config.num_classes)
 
-    def forward(self, x):
+    def _compute_embedding(self, x):
         out = self.encoder(x)
-
         out = out.view(x.size(0), -1)
         emb = self.projector(out)
+        return emb
 
+    def forward(self, x):
+        emb = self._compute_embedding(x)
         cls = self.classifier(emb)
-
         return emb, cls
+
+    def encode(self, x):
+        return self._compute_embedding(x)

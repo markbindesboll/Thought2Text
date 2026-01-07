@@ -4,6 +4,8 @@ import json
 import torch
 import numpy as np
 from tqdm import tqdm
+
+os.environ.setdefault("HF_DISABLE_PROGRESS_BARS", "1")
 from datautils import EEGDataset, Splitter
 from channelnet.model import ChannelNetModel
 from channelnet.config import EEGModelConfig
@@ -42,6 +44,8 @@ class EEGEncoderTrainer(Trainer):
         cls_loss_fn=None,
         clip_model=None,
         data_loaders=None,
+        stage1_mode="encode_only",
+        tqdm_enabled=True,
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -49,9 +53,15 @@ class EEGEncoderTrainer(Trainer):
         self.cls_loss_fn = cls_loss_fn
         self.clip_model = clip_model
         self.data_loaders = data_loaders
-        self.metric = evaluate.load("accuracy")
+        self.stage1_mode = stage1_mode
+        self.metric = (
+            evaluate.load("accuracy")
+            if self.stage1_mode == "classify_and_encode"
+            else None
+        )
         self.softmax = torch.nn.Softmax(dim=1)
         self.device = "cpu"
+        self.tqdm_enabled = tqdm_enabled
 
     def compute_loss(self, model, inputs, return_outputs=False):
         self.model.train()
@@ -59,12 +69,19 @@ class EEGEncoderTrainer(Trainer):
         image_embeddings = self.clip_model(
             pixel_values=img_data["pixel_values"]
         ).image_embeds
-        emb_output, cls_output = model(eeg)
-        emb_loss = self.emb_loss_fn(E1=emb_output, E2=image_embeddings)
-        cls_loss = self.cls_loss_fn(cls_output, labels)
-        loss = cls_loss + emb_loss
+        if self.stage1_mode == "encode_only":
+            emb_output = model.encode(eeg)
+            emb_loss = self.emb_loss_fn(E1=emb_output, E2=image_embeddings)
+            loss = emb_loss
+            outputs = emb_output
+        else:
+            emb_output, cls_output = model(eeg)
+            emb_loss = self.emb_loss_fn(E1=emb_output, E2=image_embeddings)
+            cls_loss = self.cls_loss_fn(cls_output, labels)
+            loss = cls_loss + emb_loss
+            outputs = cls_output
         self.device = eeg.device
-        return (loss, cls_output) if return_outputs else loss
+        return (loss, outputs) if return_outputs else loss
 
     def get_train_dataloader(self):
         return self.data_loaders["train"]
@@ -83,57 +100,65 @@ class EEGEncoderTrainer(Trainer):
     ):
         self.model.eval()
         eval_dataloader = self.get_eval_dataloader(eval_dataset=None)
-        eval_loss = 0
-        all_labels = []
-        all_preds = []
-        for batch in tqdm(eval_dataloader):
-            image_raw, eeg_data, labels = batch
-            image_raw = image_raw.to(self.device)
-            eeg_data = eeg_data.to(self.device)
-            labels = labels.to(self.device)
-            image_embeddings = self.clip_model(
-                pixel_values=image_raw["pixel_values"]
-            ).image_embeds
-            emb_output, cls_output = self.model(eeg_data)
-            emb_loss = self.emb_loss_fn(E1=emb_output, E2=image_embeddings)
-            cls_loss = self.cls_loss_fn(cls_output, labels)
-            loss = cls_loss + emb_loss
-            eval_loss += loss.item()
-            preds = self.softmax(cls_output).argmax(dim=1)
-            for l in labels:
-                all_labels.append(l.item())
-            for o in preds:
-                all_preds.append(o.item())
-        eval_metric = self.metric.compute(predictions=all_preds, references=all_labels)
-        print({"eval_loss": eval_loss, "acc": eval_metric["accuracy"]})
+        eval_metrics = self._run_split(eval_dataloader, split_name="eval")
 
-        # Do testing
+        # Do testing so trainer_state logs eval/test on same scale
         test_dataloader = self.get_test_dataloader(test_dataset=None)
-        test_loss = 0
+        test_metrics = self._run_split(test_dataloader, split_name="test")
+
+        metrics = {**eval_metrics, **test_metrics}
+
+        if self.stage1_mode == "classify_and_encode" and "eval_acc" in eval_metrics:
+            metrics["eval_loss"] = -eval_metrics["eval_acc"]
+        else:
+            metrics["eval_loss"] = eval_metrics.get("eval_loss", 0.0)
+
+        return metrics
+
+    def _run_split(self, dataloader, split_name):
+        compute_cls = self.stage1_mode == "classify_and_encode"
+        split_loss = 0.0
+        batch_count = 0
         all_labels = []
         all_preds = []
-        for batch in tqdm(test_dataloader):
+        iterator = tqdm(
+            dataloader,
+            disable=not self.tqdm_enabled,
+            dynamic_ncols=True,
+            leave=False,
+        )
+        for batch in iterator:
             image_raw, eeg_data, labels = batch
             image_raw = image_raw.to(self.device)
             eeg_data = eeg_data.to(self.device)
-            labels = labels.to(self.device)
-            image_embeddings = self.clip_model(
-                pixel_values=image_raw["pixel_values"]
-            ).image_embeds
-            emb_output, cls_output = self.model(eeg_data)
-            emb_loss = self.emb_loss_fn(E1=emb_output, E2=image_embeddings)
-            cls_loss = self.cls_loss_fn(cls_output, labels)
-            loss = cls_loss + emb_loss
-            test_loss += loss.item()
-            preds = self.softmax(cls_output).argmax(dim=1)
-            for l in labels:
-                all_labels.append(l.item())
-            for o in preds:
-                all_preds.append(o.item())
-        test_metric = self.metric.compute(predictions=all_preds, references=all_labels)
-        print({"test_loss": test_loss, "acc": test_metric["accuracy"]})
-
-        return {"eval_loss": -eval_metric["accuracy"]}
+            if compute_cls:
+                labels = labels.to(self.device)
+            with torch.no_grad():
+                image_embeddings = self.clip_model(
+                    pixel_values=image_raw["pixel_values"]
+                ).image_embeds
+                if compute_cls:
+                    emb_output, cls_output = self.model(eeg_data)
+                    emb_loss = self.emb_loss_fn(E1=emb_output, E2=image_embeddings)
+                    cls_loss = self.cls_loss_fn(cls_output, labels)
+                    loss = cls_loss + emb_loss
+                    preds = self.softmax(cls_output).argmax(dim=1)
+                    all_labels.extend(labels.detach().cpu().tolist())
+                    all_preds.extend(preds.detach().cpu().tolist())
+                else:
+                    emb_output = self.model.encode(eeg_data)
+                    loss = self.emb_loss_fn(E1=emb_output, E2=image_embeddings)
+            split_loss += loss.item()
+            batch_count += 1
+        avg_loss = split_loss / batch_count if batch_count else 0.0
+        metrics = {f"{split_name}_loss": avg_loss}
+        if compute_cls and self.metric is not None and all_labels:
+            metric = self.metric.compute(
+                predictions=all_preds, references=all_labels
+            )
+            metrics[f"{split_name}_acc"] = metric["accuracy"]
+        print(metrics)
+        return metrics
 
 
 def set_gradients(module, requires_grad):
@@ -171,6 +196,11 @@ def main():
 
     config.save_pretrained(args.output)
     model = ChannelNetModel(config=config)
+    print(f"Stage-1 training mode: {args.stage1_mode}")
+    if args.stage1_mode == "encode_only":
+        set_gradients(model.classifier, False)
+
+    tqdm_enabled = False
 
     training_arguments = TrainingArguments(
         output_dir=args.output,
@@ -178,7 +208,6 @@ def main():
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
         optim=args.optim,
-        save_steps=args.save_steps,
         logging_steps=args.logging_steps,
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
@@ -189,9 +218,12 @@ def main():
         lr_scheduler_type=args.lr_scheduler_type,
         load_best_model_at_end=True,
         save_strategy="epoch",
+        metric_for_best_model="eval_loss",
+        greater_is_better=False,
+        save_total_limit=2,
         eval_strategy="epoch",
-        run_name = args.run_name,
-        report_to="none"
+        report_to="none",
+        disable_tqdm=not tqdm_enabled,
     )
     trainer = EEGEncoderTrainer(
         model=model,
@@ -202,6 +234,8 @@ def main():
         cls_loss_fn=torch.nn.CrossEntropyLoss(),
         data_loaders=loaders,
         clip_model=clip_model,
+        stage1_mode=args.stage1_mode,
+        tqdm_enabled=tqdm_enabled,
     )
     trainer.train()
     model.save_pretrained(args.output)

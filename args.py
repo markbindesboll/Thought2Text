@@ -58,6 +58,17 @@ def get_args_for_encoder_training():
 
     parser.add_argument("--device", type=str, default="cuda")
 
+    parser.add_argument(
+        "--stage1_mode",
+        type=str,
+        default="encode_only",
+        help=(
+            "Stage-1 training mode: encode_only trains only EEG-to-CLIP alignment "
+            "(recommended when label spaces differ between train and eval), "
+            "classify_and_encode adds the auxiliary classification loss."
+        ),
+    )
+
     # train args
 
     parser.add_argument(
@@ -73,7 +84,7 @@ def get_args_for_encoder_training():
         help="Number of steps between saving checkpoints.",
     )
     parser.add_argument(
-        "--logging_steps", default=30, type=int, help="Number of steps between logging."
+        "--logging_steps", default=100, type=int, help="Number of steps between logging."
     )
     parser.add_argument(
         "--learning_rate",
@@ -121,6 +132,11 @@ def get_args_for_encoder_training():
     )
     # Parse arguments
     args = parser.parse_args()
+    valid_modes = {"encode_only", "classify_and_encode"}
+    if args.stage1_mode not in valid_modes:
+        raise ValueError(
+            f"Invalid stage1_mode '{args.stage1_mode}'. Choose from {sorted(valid_modes)}."
+        )
     return args
 
 
@@ -146,13 +162,6 @@ def get_args_for_llm_finetuning():
         type=str,
         required=True,
         help="Directory to save the model checkpoints and logs.",
-    )
-    parser.add_argument(
-        "--run_name",
-        type=str,
-        required=False,
-        default="llm_finetune",
-        help="Run name for logging/experiment tracking (wandb/tensorboard).",
     )
 
     parser.add_argument(

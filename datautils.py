@@ -55,7 +55,7 @@ class EEGDataset:
         #eeg = eeg.t()
         eeg = eeg.view(1, len(self.channels), len(self.times))
         label = self.data[i]["label"]
-        label_string = self.labels[self.data[i]["image"]]
+        label_string = self.labels[label]
         image_name = self.images[self.data[i]["image"]]
         # Sanity check
         # print("n_channels:", len(self.channels), "n_times:", len(self.times))
@@ -84,7 +84,7 @@ class EEGDataset:
         if self.fine_tuning:
             return image_raw, eeg, label_string
         else:
-            return image_raw, eeg, label # adjust label to be zero-indexed for Pytorch
+            return image_raw, eeg, label 
 
 
 class Splitter:
