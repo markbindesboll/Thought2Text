@@ -1,118 +1,138 @@
 #!/usr/bin/env python3
-"""
-Plots:
-1) Training loss per step (dense curve)
-2) Val/Test loss per epoch (separate plot)
+"""Parse training log and plot train / eval / test loss curves.
 
-Assumes:
-  data/runs/<run_name>/checkpoint-*/trainer_state.json
-"""
+Usage:
+  python tools/checkpoint_plot.py --log logs/train_sub01_encode_only_bs32_1.log --outdir logs
 
+Saves a PNG file named <logfile>_loss_plot.png into --outdir.
+"""
 import argparse
-import json
+import ast
 import os
-import glob
+import re
+from collections import defaultdict
+
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 
-def parse_args():
-    p = argparse.ArgumentParser()
-    p.add_argument(
-        "--run_name",
-        type=str,
-        required=True,
-        help="Run name under data/runs/ (e.g. sub01_encode_only)",
-    )
-    return p.parse_args()
+def parse_log(path):
+    train_epochs = []
+    train_loss = []
+    eval_epochs = []
+    eval_loss = []
+    test_epochs = []
+    test_loss = []
+
+    last_epoch = 0.0
+    with open(path, "r") as f:
+        for line in f:
+            # find first {...} substring
+            m = re.search(r"\{.*\}", line)
+            if not m:
+                continue
+            s = m.group(0)
+            try:
+                d = ast.literal_eval(s)
+            except Exception:
+                continue
+
+            # training step (has 'loss' and usually 'epoch')
+            if "loss" in d and "epoch" in d:
+                try:
+                    e = float(d.get("epoch", last_epoch))
+                    l = float(d.get("loss"))
+                except Exception:
+                    continue
+                last_epoch = e
+                train_epochs.append(e)
+                train_loss.append(l)
+
+            # sometimes eval/test use different keys
+            if "eval_loss" in d:
+                try:
+                    l = float(d.get("eval_loss"))
+                except Exception:
+                    continue
+                # place eval point at the most recent epoch
+                eval_epochs.append(last_epoch)
+                eval_loss.append(l)
+
+            if "test_loss" in d:
+                try:
+                    l = float(d.get("test_loss"))
+                except Exception:
+                    continue
+                test_epochs.append(last_epoch)
+                test_loss.append(l)
+
+    return {
+        "train_epochs": train_epochs,
+        "train_loss": train_loss,
+        "eval_epochs": eval_epochs,
+        "eval_loss": eval_loss,
+        "test_epochs": test_epochs,
+        "test_loss": test_loss,
+    }
+
+
+def plot_losses(parsed, outpath, title=None):
+    plt.figure(figsize=(8, 5))
+    if parsed["train_epochs"]:
+        plt.plot(parsed["train_epochs"], parsed["train_loss"], label="train loss", color="C0", alpha=0.8)
+    if parsed["eval_epochs"]:
+        plt.scatter(parsed["eval_epochs"], parsed["eval_loss"], label="eval loss", color="C1", s=12)
+        plt.plot(parsed["eval_epochs"], parsed["eval_loss"], color="C1", alpha=0.6)
+    if parsed["test_epochs"]:
+        plt.scatter(parsed["test_epochs"], parsed["test_loss"], label="test loss", color="C2", s=12)
+        plt.plot(parsed["test_epochs"], parsed["test_loss"], color="C2", alpha=0.6)
+
+    # mark best (lowest) test loss with a vertical line matching test color (no legend entry)
+    if parsed["test_epochs"] and parsed["test_loss"]:
+        try:
+            best_idx = min(range(len(parsed["test_loss"])), key=lambda i: parsed["test_loss"][i])
+            best_test_epoch = parsed["test_epochs"][best_idx]
+            plt.axvline(best_test_epoch, color="C2", linestyle="--", linewidth=1.2, label="_nolegend_")
+        except Exception:
+            pass
+
+    # mark best (lowest) eval loss with a vertical line matching eval color (no legend entry)
+    if parsed["eval_epochs"] and parsed["eval_loss"]:
+        try:
+            best_idx = min(range(len(parsed["eval_loss"])), key=lambda i: parsed["eval_loss"][i])
+            best_eval_epoch = parsed["eval_epochs"][best_idx]
+            plt.axvline(best_eval_epoch, color="C1", linestyle="--", linewidth=1.2, label="_nolegend_")
+        except Exception:
+            pass
+
+    plt.xlabel("epoch")
+    plt.ylabel("loss")
+    if title:
+        plt.title(title)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(outpath)
+    plt.close()
 
 
 def main():
-    args = parse_args()
-    run_dir = os.path.join("data", "runs", args.run_name)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--log", required=True, help="path to training log")
+    ap.add_argument("--outdir", default="logs", help="output directory for PNG")
+    ap.add_argument("--name", default=None, help="output filename (without ext)")
+    args = ap.parse_args()
 
-    if not os.path.isdir(run_dir):
-        raise FileNotFoundError(f"Run directory not found: {run_dir}")
+    parsed = parse_log(args.log)
+    os.makedirs(args.outdir, exist_ok=True)
+    base = args.name or os.path.splitext(os.path.basename(args.log))[0]
+    outpath = os.path.join(args.outdir, f"{base}_loss_plot.png")
+    title = f"Loss curves — {base}"
+    plot_losses(parsed, outpath, title=title)
 
-    # ---- find latest checkpoint ----
-    checkpoints = sorted(
-        glob.glob(os.path.join(run_dir, "checkpoint-*")),
-        key=lambda p: int(p.split("-")[-1]),
-    )
-    if not checkpoints:
-        raise RuntimeError(f"No checkpoints found in {run_dir}")
-
-    ckpt_dir = checkpoints[-1]
-    state_path = os.path.join(ckpt_dir, "trainer_state.json")
-
-    with open(state_path, "r") as f:
-        state = json.load(f)
-
-    logs = state.get("log_history", [])
-    if not logs:
-        raise RuntimeError("No log_history found in trainer_state.json")
-
-    # ------------------------------------------------------------------
-    # Plot 1: TRAINING LOSS PER STEP (original behavior)
-    # ------------------------------------------------------------------
-    train_steps = []
-    train_loss = []
-
-    for entry in logs:
-        if "loss" in entry and "step" in entry:
-            train_steps.append(entry["step"])
-            train_loss.append(entry["loss"])
-
-    plt.figure(figsize=(10, 6))
-    plt.plot(train_steps, train_loss, label="Train loss", linewidth=1)
-    plt.xlabel("Step")
-    plt.ylabel("Loss")
-    plt.title(f"Training curves – {args.run_name}")
-    plt.grid(alpha=0.3)
-    plt.legend()
-    plt.tight_layout()
-
-    out_train = os.path.join(ckpt_dir, "training_curves.png")
-    plt.savefig(out_train, dpi=200)
-    plt.close()
-
-    # ------------------------------------------------------------------
-    # Plot 2: VAL + TEST PER EPOCH ONLY
-    # ------------------------------------------------------------------
-    val_epochs, val_loss = [], []
-    test_epochs, test_loss = [], []
-
-    for entry in logs:
-        if "eval_loss" in entry and "epoch" in entry:
-            val_epochs.append(int(entry["epoch"]))
-            val_loss.append(entry["eval_loss"])
-
-        if "test_loss" in entry and "epoch" in entry:
-            test_epochs.append(int(entry["epoch"]))
-            test_loss.append(entry["test_loss"])
-
-    plt.figure(figsize=(10, 6))
-
-    if val_epochs:
-        plt.plot(val_epochs, val_loss, marker="o", linestyle="--", label="Val loss")
-
-    if test_epochs:
-        plt.plot(test_epochs, test_loss, marker="s", linestyle=":", label="Test loss")
-
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.title(f"Val/Test curves per epoch – {args.run_name}")
-    plt.grid(alpha=0.3)
-    plt.legend()
-    plt.tight_layout()
-
-    out_valtest = os.path.join(ckpt_dir, "val_test_curves_per_epoch.png")
-    plt.savefig(out_valtest, dpi=200)
-    plt.close()
-
-    # ------------------------------------------------------------------
-    print(f"Latest checkpoint: {ckpt_dir}")
-    print(f"Saved training plot  -> {out_train}")
-    print(f"Saved val/test plot  -> {out_valtest}")
+    # print a brief summary
+    print(f"Wrote plot: {outpath}")
+    print(f"Train points: {len(parsed['train_loss'])}, eval points: {len(parsed['eval_loss'])}, test points: {len(parsed['test_loss'])}")
 
 
 if __name__ == "__main__":

@@ -46,6 +46,7 @@ class EEGEncoderTrainer(Trainer):
         data_loaders=None,
         stage1_mode="encode_only",
         tqdm_enabled=True,
+        precomputed_embeddings=None,
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -54,6 +55,7 @@ class EEGEncoderTrainer(Trainer):
         self.clip_model = clip_model
         self.data_loaders = data_loaders
         self.stage1_mode = stage1_mode
+        self.precomputed_embeddings = precomputed_embeddings
         self.metric = (
             evaluate.load("accuracy")
             if self.stage1_mode == "classify_and_encode"
@@ -65,10 +67,13 @@ class EEGEncoderTrainer(Trainer):
 
     def compute_loss(self, model, inputs, return_outputs=False):
         self.model.train()
-        img_data, eeg, labels = inputs
-        image_embeddings = self.clip_model(
-            pixel_values=img_data["pixel_values"]
-        ).image_embeds
+        img_data, eeg, labels, image_ids = inputs
+        if self.precomputed_embeddings is not None:
+            image_embeddings = self.precomputed_embeddings[image_ids.cpu()].to(eeg.device)
+        else:
+            image_embeddings = self.clip_model(
+                pixel_values=img_data["pixel_values"]
+            ).image_embeds
         if self.stage1_mode == "encode_only":
             emb_output = model.encode(eeg)
             emb_loss = self.emb_loss_fn(E1=emb_output, E2=image_embeddings)
@@ -128,15 +133,18 @@ class EEGEncoderTrainer(Trainer):
             leave=False,
         )
         for batch in iterator:
-            image_raw, eeg_data, labels = batch
+            image_raw, eeg_data, labels, image_ids = batch
             image_raw = image_raw.to(self.device)
             eeg_data = eeg_data.to(self.device)
             if compute_cls:
                 labels = labels.to(self.device)
             with torch.no_grad():
-                image_embeddings = self.clip_model(
-                    pixel_values=image_raw["pixel_values"]
-                ).image_embeds
+                if self.precomputed_embeddings is not None:
+                    image_embeddings = self.precomputed_embeddings[image_ids.cpu()].to(self.device)
+                else:
+                    image_embeddings = self.clip_model(
+                        pixel_values=image_raw["pixel_values"]
+                    ).image_embeds
                 if compute_cls:
                     emb_output, cls_output = self.model(eeg_data)
                     emb_loss = self.emb_loss_fn(E1=emb_output, E2=image_embeddings)
@@ -169,12 +177,21 @@ def set_gradients(module, requires_grad):
 def main():
     args = get_args_for_encoder_training()
     set_seed(42)
-    # processor = AutoProcessor.from_pretrained(args.clip_model)
-    clip_model = CLIPVisionModelWithProjection.from_pretrained(args.clip_model)
-    clip_model.to(args.device)
-    clip_model.requires_grad_(False)
-    set_gradients(clip_model, False)
-    clip_model.eval()
+    
+    # Load precomputed image embeddings if available
+    precomputed_embeddings = None
+    embeddings_path = "/zhome/73/b/145313/thesis/data/images/image_embeddings_list.pth"  # Path to precomputed embeddings
+    if os.path.exists(embeddings_path):
+        print(f"Loading precomputed embeddings from {embeddings_path}")
+        precomputed_embeddings = torch.load(embeddings_path, weights_only=False)
+        clip_model = None
+    else:
+        print("No precomputed embeddings found, using CLIP model")
+        clip_model = CLIPVisionModelWithProjection.from_pretrained(args.clip_model)
+        clip_model.to(args.device)
+        clip_model.requires_grad_(False)
+        set_gradients(clip_model, False)
+        clip_model.eval()
 
     dataset = EEGDataset(args=args)
     loaders = {
@@ -236,6 +253,7 @@ def main():
         clip_model=clip_model,
         stage1_mode=args.stage1_mode,
         tqdm_enabled=tqdm_enabled,
+        precomputed_embeddings=precomputed_embeddings,
     )
     trainer.train()
     model.save_pretrained(args.output)

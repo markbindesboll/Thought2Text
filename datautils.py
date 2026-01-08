@@ -80,11 +80,12 @@ class EEGDataset:
 
         image_raw = self.processor(images=image_raw, return_tensors="pt", padding=True)
         image_raw["pixel_values"] = image_raw["pixel_values"].squeeze(0)
+        image_id = self.data[i]["image"]
 
         if self.fine_tuning:
-            return image_raw, eeg, label_string
+            return image_raw, eeg, label_string, image_id
         else:
-            return image_raw, eeg, label 
+            return image_raw, eeg, label, image_id 
 
 
 class Splitter:
@@ -106,7 +107,7 @@ class Splitter:
         # Compute size
         self.size = len(self.split_idx)
         self.fine_tuning = fine_tuning
-        print(f"Total examples in the spllit{split_name} {self.size}")
+        print(f"Total examples in the split {split_name} {self.size}")
 
     # Get size
     def __len__(self):
@@ -119,8 +120,9 @@ class Splitter:
             img_data, eeg, label_string = self.dataset[self.split_idx[i]]
             return img_data, eeg, label_string
         else:
-            img_data, eeg, label = self.dataset[self.split_idx[i]]
-            return img_data, eeg, label
+            # Preserve image_id so downstream code (train/test) can index precomputed embeddings
+            img_data, eeg, label, image_id = self.dataset[self.split_idx[i]]
+            return img_data, eeg, label, image_id
 
 
 
