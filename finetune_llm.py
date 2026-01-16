@@ -66,24 +66,26 @@ def set_gradients(module, requires_grad):
 
 
 class Stage2Trainer(Trainer):
-    def __init__(self, clip_model=None, data_loaders=None, tokenizer=None, **kwargs):
+    def __init__(self, clip_model=None, data_loaders=None, tokenizer=None, precomputed_embeddings=None, **kwargs):
         super().__init__(**kwargs)
         self.clip_model = clip_model
         self.data_loaders = data_loaders
         self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
         self.tokenizer = tokenizer
+        self.precomputed_embeddings = precomputed_embeddings
 
     def compute_loss(self, model, inputs, return_outputs=False):
         (
-            img_data,
             eeg_data,
             input_ids1,
             input_ids2,
             label_string,
+            image_ids,
         ) = inputs
-        pixels = img_data["pixel_values"].to(self.device)
-        image_embeddings = self.clip_model(pixels).image_embeds
-        #image_embeddings = image_embeddings.to(self.device)
+        # Use precomputed embeddings indexed by image_id
+        if self.precomputed_embeddings is None:
+            raise RuntimeError("Precomputed embeddings are required for Stage 2 training")
+        image_embeddings = self.precomputed_embeddings[image_ids.cpu()].to(self.device)
         output, labels = model(
             input_ids1=input_ids1, input_ids2=input_ids2, mm_embeds=image_embeddings
         )
@@ -101,23 +103,37 @@ class Stage2Trainer(Trainer):
 
 
 class Stage3Trainer(Trainer):
-    def __init__(self, data_loaders=None, tokenizer=None, **kwargs):
+    def __init__(self, data_loaders=None, tokenizer=None, use_filter=False, eeg_encoder=None, **kwargs):
         super().__init__(**kwargs)
         self.data_loaders = data_loaders
         self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
         self.tokenizer = tokenizer
+        self.use_filter = use_filter
+        self.eeg_encoder = eeg_encoder
 
     def compute_loss(self, model, inputs, return_outputs=False):
-        (
-            eeg_data,
-            input_ids1,
-            input_ids2,
-        ) = inputs
-        #eeg_data = eeg_data.to(self.device)
-        #input_ids1 = input_ids1.to(self.device)
-        #input_ids2 = input_ids2.to(self.device)
+        if self.use_filter:
+            # Filtered data: (eeg_embeddings, input_ids1, input_ids2)
+            (
+                eeg_embeddings,
+                input_ids1,
+                input_ids2,
+            ) = inputs
+        else:
+            # Unfiltered data: (eeg, input_ids1, input_ids2, label_string, image_id)
+            # Need to encode EEG to get embeddings
+            (
+                eeg,
+                input_ids1,
+                input_ids2,
+                label_string,
+                image_id,
+            ) = inputs
+            with torch.no_grad():
+                eeg_embeddings = self.eeg_encoder.encode(eeg)
+        
         output, labels = model(
-            input_ids1=input_ids1, input_ids2=input_ids2, mm_embeds=eeg_data
+            input_ids1=input_ids1, input_ids2=input_ids2, mm_embeds=eeg_embeddings
         )
         # print("Labels", self.tokenizer.batch_decode(labels))
         return (output.loss, output) if return_outputs else output.loss
@@ -167,27 +183,56 @@ def main():
     set_gradients(module=model.eeg_encoder, requires_grad=False)
     set_gradients(module=model.llm, requires_grad=False)
 
+    # Load precomputed image embeddings (required for stage 2)
+    embeddings_path = "/zhome/73/b/145313/thesis/data/images/image_embeddings_list.pth"  # User must change this
+    if not os.path.exists(embeddings_path):
+        raise FileNotFoundError(
+            f"Precomputed embeddings not found at {embeddings_path}. "
+            "Please provide valid embeddings file for stage 2 training."
+        )
+    logger.info(f"Loading precomputed embeddings from {embeddings_path}")
+    precomputed_embeddings = torch.load(embeddings_path, weights_only=False)
+    
+    # Load precomputed captions (required)
+    captions_path = "/zhome/73/b/145313/thesis/data/images/captions_list.pth"  # User must change this
+    if not os.path.exists(captions_path):
+        raise FileNotFoundError(
+            f"Ground Truth captions not found at {captions_path}. "
+            "Please provide valid captions file."
+        )
+    logger.info(f"Loading ground truth captions from {captions_path}")
+    captions = torch.load(captions_path, weights_only=False)
+
     dataset = EEGFineTuningDataset(
-        args=args, tokenizer_path=args.llm_backbone_name_or_path
+        args=args, tokenizer_path=args.llm_backbone_name_or_path, captions=captions
     )
     
     if not args.no_stage2:
         logger.info("STAGE 2: LLM fine tuning on images")
         llm_name = args.llm_backbone_name_or_path.split("/")[1]
         pretrained_path = os.path.join(args.saved_pretrained_model_path, llm_name)
+        llm_path = os.path.join(pretrained_path, "llm")
+        projector_path = os.path.join(pretrained_path, "projector.pth")
         
-        if os.path.exists(pretrained_path) and os.path.isdir(pretrained_path):
-            print(f"Stage 3 trained model already available. Loadig model from {pretrained_path}. Skipping retraining")
+        # Check if Stage 2 model actually exists (not just the directory)
+        if os.path.exists(llm_path) and os.path.exists(projector_path):
+            print(f"Stage 2 model found at {pretrained_path}. Loading LLM and projector, using encoder from args.")
             del model
             gc.collect()
-            model = EEGModelForCausalLM.from_pretrained(
-                pretrained_model_name_or_path=pretrained_path,llm_low_cpu_mem_usage= True
+            # Load Stage 2 model but use the encoder from args (not from checkpoint)
+            model = EEGModelForCausalLM.from_separate_pretrained(
+                eeg_encoder_path=args.eeg_encoder_path,
+                llm_path=llm_path,
+                use_lora=args.use_lora,
+                llm_low_cpu_mem_usage=True,
             )
-
+            # Load the projector weights from Stage 2
+            model.mm_proj.load_state_dict(torch.load(projector_path))
+            
             model.eeg_encoder.to(args.device)
             model.mm_proj.to(args.device)
             set_gradients(module=model.eeg_encoder, requires_grad=False)
-            model.llm.save_pretrained(os.path.join(pretrained_path, "llm"))
+            model.llm.save_pretrained(llm_path)
 
 
         else:           
@@ -213,78 +258,76 @@ def main():
             )
 
 
-            # Load CLIP model for stage 3
-            clip_model = CLIPVisionModelWithProjection.from_pretrained(args.clip_model)
-            clip_model.requires_grad_(False)
-            clip_model.eval()
-            clip_model.to(args.device)
-            if (args.subject!=0):
-                # for subjectwise analysis
-                # We need to warmup with all images
-                new_args = copy.deepcopy(args)
-                new_args.subject = 0
-                new_args.splits_path = new_args.splits_path.replace("image_single", "image_all")
-                img_dataset = EEGFineTuningDataset(
-                    args=new_args, tokenizer_path=args.llm_backbone_name_or_path
-                )   
-                loaders = {
-                    split: DataLoader(
-                        SplitterFineTuning(
-                            img_dataset,
-                            split_path=new_args.splits_path,
-                            split_num=new_args.split_num,
-                            split_name=split,
-                        ),
-                        batch_size=new_args.batch_size,
-                        drop_last=True,
-                        shuffle=True,
-                    )
-                    for split in ["train", "val", "test"]
-                }
-                trainer = Stage2Trainer(
-                    model=model,
-                    args=training_arguments_stage2,
-                    train_dataset=img_dataset,
-                    eval_dataset=img_dataset,
-                    data_loaders=loaders,
-                    clip_model=clip_model,
-                    tokenizer=img_dataset.tokenizer,
+            # Stage 2 uses precomputed embeddings (no CLIP model needed)
+            loaders = {
+                split: DataLoader(
+                    SplitterFineTuning(
+                        dataset,
+                        split_path=args.splits_path,
+                        split_num=args.split_num,
+                        split_name=split,
+                    ),
+                    batch_size=args.batch_size,
+                    drop_last=True,
+                    shuffle=True,
                 )
-            else:
-                loaders = {
-                    split: DataLoader(
-                        SplitterFineTuning(
-                            dataset,
-                            split_path=args.splits_path,
-                            split_num=args.split_num,
-                            split_name=split,
-                        ),
-                        batch_size=args.batch_size,
-                        drop_last=True,
-                        shuffle=True,
-                    )
-                    for split in ["train", "val", "test"]
-                }
+                for split in ["train", "val", "test"]
+            }
 
-                trainer = Stage2Trainer(
-                    model=model,
-                    args=training_arguments_stage2,
-                    train_dataset=dataset,
-                    eval_dataset=dataset,
-                    data_loaders=loaders,
-                    clip_model=clip_model,
-                    tokenizer=dataset.tokenizer,
-                )
+            trainer = Stage2Trainer(
+                model=model,
+                args=training_arguments_stage2,
+                train_dataset=dataset,
+                eval_dataset=dataset,
+                data_loaders=loaders,
+                clip_model=None,
+                tokenizer=dataset.tokenizer,
+                precomputed_embeddings=precomputed_embeddings,
+            )
             trainer.train()
-            model.save_pretrained(pretrained_path)
+            # Save Stage 2: only LLM and projector (not encoder - it's frozen and comes from args)
+            os.makedirs(pretrained_path, exist_ok=True)
+            torch.save(model.mm_proj.state_dict(), os.path.join(pretrained_path, "projector.pth"))
             model.llm.save_pretrained(os.path.join(pretrained_path, "llm"))
             dataset.tokenizer.save_pretrained(pretrained_path)
 
-            del clip_model
             del loaders
             gc.collect()
     
-    loaders = {
+    # Stage 3: Train on EEG data
+    # Check if encoder was trained in encode_only mode (classifier not trained)
+    # If so, skip filtering since we can't predict labels
+    encoder_config_path = os.path.join(args.eeg_encoder_path, "config.json")
+    stage1_mode = "encode_only"  # default
+    if os.path.exists(encoder_config_path):
+        with open(encoder_config_path) as f:
+            encoder_config = json.load(f)
+            # Check if this info is stored, otherwise assume encode_only
+            stage1_mode = encoder_config.get("stage1_mode", "encode_only")
+    
+    logger.info(f"Stage 3: EEG encoder was trained in '{stage1_mode}' mode")
+    
+    if stage1_mode == "encode_only":
+        # No filtering - encoder can't predict labels reliably
+        logger.info("Skipping data filtering (encode_only mode)")
+        loaders = {
+            split: DataLoader(
+                SplitterFineTuning(
+                    dataset,
+                    split_path=args.splits_path,
+                    split_num=args.split_num,
+                    split_name=split,
+                ),
+                batch_size=args.batch_size,
+                drop_last=True,
+                shuffle=True,
+            )
+            for split in ["train", "val", "test"]
+        }
+    else:
+        # Use Filter to keep only samples with correct predicted labels
+        logger.info("Applying data filtering (classify_and_encode mode)")
+        loaders = {
             split: DataLoader(
                 Filter(SplitterFineTuning(
                     dataset,
@@ -328,6 +371,8 @@ def main():
         eval_dataset=dataset,
         data_loaders=loaders,
         tokenizer=dataset.tokenizer,
+        use_filter=(stage1_mode != "encode_only"),
+        eeg_encoder=model.eeg_encoder,
     )
     trainer.train()
     model.save_pretrained(args.output)

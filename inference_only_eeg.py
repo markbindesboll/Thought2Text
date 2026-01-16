@@ -8,7 +8,11 @@ import torch
 import json
 import os
 import numpy as np
+import warnings
 
+# Suppress repetitive warnings
+warnings.filterwarnings('ignore', category=UserWarning, module='transformers')
+os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
 from tqdm import tqdm
 from args import get_args_for_llm_inference
@@ -70,10 +74,20 @@ def main():
     model.eeg_encoder.to(args.device)
     model.mm_proj.to(args.device)
     model.eval()
-    softmax = torch.nn.Softmax(dim=1)
+
+    # Load precomputed captions (required)
+    captions_path = "/zhome/73/b/145313/thesis/data/images/captions_list.pth"  # User must change this
+    if not os.path.exists(captions_path):
+        raise FileNotFoundError(
+            f"Ground Truth captions not found at {captions_path}. "
+            "Please provide valid captions file."
+        )
+    logger.info(f"Loading ground truth captions from {captions_path}")
+    captions = torch.load(captions_path, weights_only=False)
 
     dataset = EEGInferenceDataset(
         args=args,
+        captions=captions,
     )
     loaders = {
         split: DataLoader(
@@ -91,23 +105,15 @@ def main():
     }
     test_dataloader = loaders["test"]
 
-    with open(os.path.join(args.model_path, "id2label.json")) as f:
-        id2label = json.load(f)
-        id2label = {int(k): v for k, v in id2label.items()}
-
     all_data = []
 
         
 
     for batch in tqdm(test_dataloader):
-        eeg, label_string, caption_raw, image_path = batch
+        eeg, label_string, caption_raw, image_path, image_id = batch
         eeg = eeg.to(args.device)
-        emb_out, cls_out = model.eeg_encoder(eeg)
-        preds = softmax(cls_out).argmax(dim=1)
-
-        pred_label_strings = []
-        for p in preds:
-            pred_label_strings.append(id2label[p.item()])
+        # In encode_only mode, use encode() method to get only embeddings (no classifier output)
+        emb_out = model.eeg_encoder.encode(eeg)
 
         batched_input_ids1 = []
         batched_input_ids2 = []
@@ -115,19 +121,15 @@ def main():
         batch_data = []
 
         for i, exp_label in enumerate(label_string):
-            #print(f"Expected label: {exp_label}")
-            #print(f"Output pred: {pred_label_strings[i]}")
             data = {}
             data["Ground Truth Image"] = image_path[i]
             data["Expected object"] = exp_label
-            data["Predicted object"] = pred_label_strings[i]
+            data["Image ID"] = image_id[i].item() if torch.is_tensor(image_id[i]) else image_id[i]
             batch_data.append(data)
             new_text = text
             ps = new_text.split("<image>")
             prefix = ps[0]
             suffix = ps[1]
-            print("Prefix", prefix)
-            print("Suffix", suffix)
             individual_input_ids1 = tokenizer(
                 prefix,
                 add_special_tokens=False,

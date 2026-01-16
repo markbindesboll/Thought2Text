@@ -12,7 +12,7 @@ def get_args_for_encoder_training():
     parser.add_argument(
         "--eeg_dataset", default=None, help="EEG dataset path"
     )  # 5-95Hz
-    parser.add_argument("--image_dir", default=None, help="ImageNet dataset path")
+    parser.add_argument("--image_dir", default=".", help="ImageNet dataset path (not used in finetuning, kept for compatibility)")
     # Splits
     parser.add_argument(
         "--splits_path", default=None, help="splits path"

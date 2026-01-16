@@ -63,13 +63,13 @@ class EEGModelForCausalLM(PreTrainedModel):
 
         if self.eeg_encoder.config.to_dict() != self.config.eeg_encoder.to_dict():
             logger.warning(
-                f"Config of the encoder: {self.encoder.__class__} is overwritten by shared encoder config:"
-                f" {self.config.encoder}"
+                f"Config of the encoder: {self.eeg_encoder.__class__} is overwritten by shared encoder config:"
+                f" {self.config.eeg_encoder}"
             )
         if self.llm.config.to_dict() != self.config.llm.to_dict():
             logger.warning(
-                f"Config of the decoder: {self.decoder.__class__} is overwritten by shared decoder config:"
-                f" {self.config.decoder}"
+                f"Config of the decoder: {self.llm.__class__} is overwritten by shared decoder config:"
+                f" {self.config.llm}"
             )
 
         self.eeg_encoder.config = self.config.eeg_encoder
@@ -164,17 +164,12 @@ class EEGModelForCausalLM(PreTrainedModel):
                     "to be defined."
                 )
 
+            # Load config first, then model
             if "config" not in kwargs_eeg_encoder:
-                eeg_encoder_config, kwargs_eeg_encoder = (
-                    EEGEncoderConfig.from_pretrained(
-                        eeg_encoder_path,
-                        **kwargs_eeg_encoder,
-                        return_unused_kwargs=True,
-                    )
-                )
-
+                from channelnet.config import EEGModelConfig
+                eeg_encoder_config = EEGModelConfig.from_pretrained(eeg_encoder_path)
                 kwargs_eeg_encoder["config"] = eeg_encoder_config
-
+            
             eeg_encoder = ChannelNetModel.from_pretrained(
                 eeg_encoder_path, *model_args, **kwargs_eeg_encoder
             )
@@ -299,11 +294,7 @@ class EEGModelForCausalLM(PreTrainedModel):
 
         # Create position ids
         final_input_embeds = final_input_embeds.to(input_embeds1.dtype)
-
-        # attention_masks = attention_masks.to(input_embeds1.dtype)
-        # print(attention_masks)
-        if type != "train":
-            attention_masks = None
+        attention_masks = attention_masks.to(input_embeds1.dtype)
 
         return final_input_embeds, attention_masks, labels
 
@@ -386,7 +377,7 @@ class EEGModelForCausalLM(PreTrainedModel):
         )
         output_ids = self.llm.generate(
             input_ids=None,
-            attention_mask=None,
+            attention_mask=attention_masks,
             position_ids=None,
             inputs_embeds=final_input_embeds,
             **kwargs,

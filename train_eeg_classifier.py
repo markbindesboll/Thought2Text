@@ -68,12 +68,9 @@ class EEGEncoderTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False):
         self.model.train()
         img_data, eeg, labels, image_ids = inputs
-        if self.precomputed_embeddings is not None:
-            image_embeddings = self.precomputed_embeddings[image_ids.cpu()].to(eeg.device)
-        else:
-            image_embeddings = self.clip_model(
-                pixel_values=img_data["pixel_values"]
-            ).image_embeds
+        if self.precomputed_embeddings is None:
+            raise RuntimeError("Precomputed embeddings are required for training")
+        image_embeddings = self.precomputed_embeddings[image_ids.cpu()].to(eeg.device)
         if self.stage1_mode == "encode_only":
             emb_output = model.encode(eeg)
             emb_loss = self.emb_loss_fn(E1=emb_output, E2=image_embeddings)
@@ -139,12 +136,9 @@ class EEGEncoderTrainer(Trainer):
             if compute_cls:
                 labels = labels.to(self.device)
             with torch.no_grad():
-                if self.precomputed_embeddings is not None:
-                    image_embeddings = self.precomputed_embeddings[image_ids.cpu()].to(self.device)
-                else:
-                    image_embeddings = self.clip_model(
-                        pixel_values=image_raw["pixel_values"]
-                    ).image_embeds
+                if self.precomputed_embeddings is None:
+                    raise RuntimeError("Precomputed embeddings are required for evaluation")
+                image_embeddings = self.precomputed_embeddings[image_ids.cpu()].to(self.device)
                 if compute_cls:
                     emb_output, cls_output = self.model(eeg_data)
                     emb_loss = self.emb_loss_fn(E1=emb_output, E2=image_embeddings)
@@ -178,20 +172,15 @@ def main():
     args = get_args_for_encoder_training()
     set_seed(42)
     
-    # Load precomputed image embeddings if available
-    precomputed_embeddings = None
+    # Load precomputed image embeddings (required)
     embeddings_path = "/zhome/73/b/145313/thesis/data/images/image_embeddings_list.pth"  # Path to precomputed embeddings
-    if os.path.exists(embeddings_path):
-        print(f"Loading precomputed embeddings from {embeddings_path}")
-        precomputed_embeddings = torch.load(embeddings_path, weights_only=False)
-        clip_model = None
-    else:
-        print("No precomputed embeddings found, using CLIP model")
-        clip_model = CLIPVisionModelWithProjection.from_pretrained(args.clip_model)
-        clip_model.to(args.device)
-        clip_model.requires_grad_(False)
-        set_gradients(clip_model, False)
-        clip_model.eval()
+    if not os.path.exists(embeddings_path):
+        raise FileNotFoundError(
+            f"Precomputed embeddings not found at {embeddings_path}. "
+            "Please provide valid embeddings file for training."
+        )
+    print(f"Loading precomputed embeddings from {embeddings_path}")
+    precomputed_embeddings = torch.load(embeddings_path, weights_only=False)
 
     dataset = EEGDataset(args=args)
     loaders = {
@@ -250,7 +239,7 @@ def main():
         emb_loss_fn=MSELoss(),
         cls_loss_fn=torch.nn.CrossEntropyLoss(),
         data_loaders=loaders,
-        clip_model=clip_model,
+        clip_model=None,
         stage1_mode=args.stage1_mode,
         tqdm_enabled=tqdm_enabled,
         precomputed_embeddings=precomputed_embeddings,
