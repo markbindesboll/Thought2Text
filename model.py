@@ -92,13 +92,30 @@ class EEGModelForCausalLM(PreTrainedModel):
     def get_llm(self):
         return self.llm
 
-    def save_pretrained(self, output_dir, *model_args, **kwargs):
-        # we need to save all the models separately
+    def save_pretrained(self, output_dir, save_encoder=False, *model_args, **kwargs):
+        """Save model components.
         
-        self.eeg_encoder.save_pretrained(
-            os.path.join(output_dir, "eeg_encoder"), *model_args, **kwargs
-        )
-        # self.llm.save_pretrained(os.path.join(output_dir, "llm"), *model_args, **kwargs)
+        Args:
+            output_dir: Directory to save to
+            save_encoder: If True, saves full encoder. If False, saves only a reference config.
+                         Set to False when encoder is frozen to save space.
+        """
+        os.makedirs(output_dir, exist_ok=True)
+        
+        if save_encoder:
+            # Save full encoder (use during Stage 1 or if encoder was trained)
+            self.eeg_encoder.save_pretrained(
+                os.path.join(output_dir, "eeg_encoder"), *model_args, **kwargs
+            )
+        else:
+            # Save only encoder reference/config to save space (encoder is frozen)
+            encoder_ref_path = os.path.join(output_dir, "eeg_encoder_path.txt")
+            with open(encoder_ref_path, "w") as f:
+                f.write(f"# This model uses a frozen EEG encoder.\n")
+                f.write(f"# Encoder not saved to conserve space.\n")
+                f.write(f"# Load encoder separately using --eeg_encoder_path argument.\n")
+        
+        # Always save projector (this is what's trained in Stage 2/3)
         torch.save(
             self.mm_proj.state_dict(),
             os.path.join(output_dir, "projector.pth"),

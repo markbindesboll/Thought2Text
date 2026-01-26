@@ -2,7 +2,7 @@
 """Parse training log and plot train / eval / test loss curves.
 
 Usage:
-  python tools/checkpoint_plot.py --log logs/train_sub01_encode_only_bs32_1.log --outdir logs
+  python tools/checkpoint_plot.py --log logs/train_sub08_run5.log --outdir logs
 
 Saves a PNG file named <logfile>_loss_plot.png into --outdir.
 """

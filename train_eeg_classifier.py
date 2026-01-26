@@ -2,6 +2,7 @@ import os
 import random
 import json
 import torch
+import torch.nn.functional as F
 import numpy as np
 from tqdm import tqdm
 
@@ -10,12 +11,13 @@ from datautils import EEGDataset, Splitter
 from channelnet.model import ChannelNetModel
 from channelnet.config import EEGModelConfig
 from args import get_args_for_encoder_training
-from loss import MSELoss
+from loss import MSELoss, InfoNCELoss
 from transformers import (
     Trainer,
     TrainingArguments,
     AutoProcessor,
     CLIPVisionModelWithProjection,
+    TrainerCallback,
 )
 from torch.utils.data import DataLoader, Dataset
 import evaluate
@@ -37,6 +39,21 @@ def set_seed(seed):
     torch.backends.cudnn.benchmark = False  # disable to ensure reproducibility
 
 
+class LRLoggingCallback(TrainerCallback):
+    """Callback to log learning rate at each step."""
+    
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if state.is_world_process_zero and logs is not None:
+            # Get current LR from optimizer
+            if hasattr(self, '_last_lr'):
+                logs['learning_rate'] = self._last_lr
+    
+    def on_step_end(self, args, state, control, **kwargs):
+        # Store the current learning rate
+        if hasattr(kwargs.get('optimizer'), 'param_groups'):
+            self._last_lr = kwargs['optimizer'].param_groups[0]['lr']
+
+
 class EEGEncoderTrainer(Trainer):
     def __init__(
         self,
@@ -47,6 +64,7 @@ class EEGEncoderTrainer(Trainer):
         stage1_mode="encode_only",
         tqdm_enabled=True,
         precomputed_embeddings=None,
+        magnitude_weight=0.0,
         **kwargs
     ):
         super().__init__(**kwargs)
@@ -56,6 +74,7 @@ class EEGEncoderTrainer(Trainer):
         self.data_loaders = data_loaders
         self.stage1_mode = stage1_mode
         self.precomputed_embeddings = precomputed_embeddings
+        self.magnitude_weight = magnitude_weight
         self.metric = (
             evaluate.load("accuracy")
             if self.stage1_mode == "classify_and_encode"
@@ -64,6 +83,8 @@ class EEGEncoderTrainer(Trainer):
         self.softmax = torch.nn.Softmax(dim=1)
         self.device = "cpu"
         self.tqdm_enabled = tqdm_enabled
+        # InfoNCE loss used only for encode_only mode; keep original emb_loss_fn for other modes
+        self.info_nce = InfoNCELoss(temperature=0.07)
 
     def compute_loss(self, model, inputs, return_outputs=False):
         self.model.train()
@@ -73,11 +94,23 @@ class EEGEncoderTrainer(Trainer):
         image_embeddings = self.precomputed_embeddings[image_ids.cpu()].to(eeg.device)
         if self.stage1_mode == "encode_only":
             emb_output = model.encode(eeg)
-            emb_loss = self.emb_loss_fn(E1=emb_output, E2=image_embeddings)
-            loss = emb_loss
+            # Normalize embeddings for InfoNCE (angular alignment)
+            emb_output_norm = F.normalize(emb_output, dim=1)
+            image_embeddings_norm = F.normalize(image_embeddings, dim=1)
+            contrastive_loss = self.info_nce(E1=emb_output_norm, E2=image_embeddings_norm)
+            
+            # Add Euclidean distance/magnitude matching if magnitude_weight > 0
+            if self.magnitude_weight > 0:
+                # MSE on raw embeddings captures both magnitude and full spatial distance
+                magnitude_loss = F.mse_loss(emb_output, image_embeddings)
+                loss = contrastive_loss + self.magnitude_weight * magnitude_loss
+            else:
+                loss = contrastive_loss
+            
             outputs = emb_output
         else:
             emb_output, cls_output = model(eeg)
+            # Keep original behavior for classify_and_encode: use emb_loss_fn on raw embeddings
             emb_loss = self.emb_loss_fn(E1=emb_output, E2=image_embeddings)
             cls_loss = self.cls_loss_fn(cls_output, labels)
             loss = cls_loss + emb_loss
@@ -141,6 +174,7 @@ class EEGEncoderTrainer(Trainer):
                 image_embeddings = self.precomputed_embeddings[image_ids.cpu()].to(self.device)
                 if compute_cls:
                     emb_output, cls_output = self.model(eeg_data)
+                    # For classify_and_encode keep original MSE embedding loss on raw embeddings
                     emb_loss = self.emb_loss_fn(E1=emb_output, E2=image_embeddings)
                     cls_loss = self.cls_loss_fn(cls_output, labels)
                     loss = cls_loss + emb_loss
@@ -149,7 +183,16 @@ class EEGEncoderTrainer(Trainer):
                     all_preds.extend(preds.detach().cpu().tolist())
                 else:
                     emb_output = self.model.encode(eeg_data)
-                    loss = self.emb_loss_fn(E1=emb_output, E2=image_embeddings)
+                    emb_output_norm = F.normalize(emb_output, dim=1)
+                    image_embeddings_norm = F.normalize(image_embeddings, dim=1)
+                    contrastive_loss = self.info_nce(E1=emb_output_norm, E2=image_embeddings_norm)
+                    
+                    # Add magnitude matching if enabled
+                    if self.magnitude_weight > 0:
+                        magnitude_loss = F.mse_loss(emb_output, image_embeddings)
+                        loss = contrastive_loss + self.magnitude_weight * magnitude_loss
+                    else:
+                        loss = contrastive_loss
             split_loss += loss.item()
             batch_count += 1
         avg_loss = split_loss / batch_count if batch_count else 0.0
@@ -243,6 +286,8 @@ def main():
         stage1_mode=args.stage1_mode,
         tqdm_enabled=tqdm_enabled,
         precomputed_embeddings=precomputed_embeddings,
+        magnitude_weight=args.magnitude_weight,
+        callbacks=[LRLoggingCallback()],
     )
     trainer.train()
     model.save_pretrained(args.output)

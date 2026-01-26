@@ -40,3 +40,30 @@ class MSELoss(nn.Module):
         # Compute the mean squared error loss
         loss = nn.functional.mse_loss(E1, E2)
         return loss
+
+
+class InfoNCELoss(nn.Module):
+    """Symmetric InfoNCE (in-batch negatives).
+
+    Expects embeddings to be L2-normalized prior to calling, or will work
+    correctly if inputs are normalized inside the trainer.
+    """
+    def __init__(self, temperature: float = 0.07):
+        super(InfoNCELoss, self).__init__()
+        self.temperature = temperature
+
+    def forward(self, E1: torch.Tensor, E2: torch.Tensor) -> torch.Tensor:
+        # E1: [B, D], E2: [B, D]
+        assert E1.dim() == 2 and E2.dim() == 2
+        B = E1.size(0)
+
+        # Compute logits: similarity matrix between E1 and E2
+        logits_12 = torch.matmul(E1, E2.t()) / self.temperature
+        logits_21 = torch.matmul(E2, E1.t()) / self.temperature
+
+        labels = torch.arange(B, device=E1.device)
+
+        loss1 = F.cross_entropy(logits_12, labels)
+        loss2 = F.cross_entropy(logits_21, labels)
+
+        return 0.5 * (loss1 + loss2)
