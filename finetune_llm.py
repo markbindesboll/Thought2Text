@@ -19,6 +19,7 @@ import gc
 import random
 import logging
 import torch
+import torch.nn.functional as F
 import numpy as np
 import json
 import copy
@@ -86,6 +87,8 @@ class Stage2Trainer(Trainer):
         if self.precomputed_embeddings is None:
             raise RuntimeError("Precomputed embeddings are required for Stage 2 training")
         image_embeddings = self.precomputed_embeddings[image_ids.cpu()].to(self.device)
+        # Normalize embeddings to ensure consistent magnitude (unit vectors)
+        image_embeddings = torch.nn.functional.normalize(image_embeddings, p=2, dim=1)
         output, labels = model(
             input_ids1=input_ids1, input_ids2=input_ids2, mm_embeds=image_embeddings
         )
@@ -131,6 +134,9 @@ class Stage3Trainer(Trainer):
             ) = inputs
             with torch.no_grad():
                 eeg_embeddings = self.eeg_encoder.encode(eeg)
+        
+        # Normalize embeddings to match Stage 2 training (unit vectors)
+        eeg_embeddings = torch.nn.functional.normalize(eeg_embeddings, p=2, dim=1)
         
         output, labels = model(
             input_ids1=input_ids1, input_ids2=input_ids2, mm_embeds=eeg_embeddings

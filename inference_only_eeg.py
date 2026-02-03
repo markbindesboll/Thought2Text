@@ -1,4 +1,4 @@
-# EEG-based image captioning inference with top-1 EEG selection
+# EEG-based image captioning inference with averaged EEG embeddings
 
 import random
 import logging
@@ -82,6 +82,7 @@ def main():
         llm_path=args.llm_backbone_name_or_path,
         use_lora=False,
         llm_low_cpu_mem_usage=True,
+        # llm_load_in_8bit=True,  # Disabled - bitsandbytes not working
     )
     
     model.eeg_encoder.to(args.device)
@@ -121,14 +122,17 @@ def main():
 
     # Prepare text prompt tokens (used by both Stage 2 and Stage 3)
     ps = text.split("<image>")
-    prefix_ids = tokenizer(ps[0], add_special_tokens=False, truncation=True, return_tensors="pt").input_ids.to(args.device)
-    suffix_ids = tokenizer(ps[1].strip(), add_special_tokens=False, truncation=True, return_tensors="pt").input_ids.to(args.device)
+    # Get LLM device to avoid slow transfers during generation
+    llm_device = next(model.llm.parameters()).device
+    logger.info(f"Moving prompt tokens to LLM device: {llm_device}")
+    prefix_ids = tokenizer(ps[0], add_special_tokens=False, truncation=True, return_tensors="pt").input_ids.to(llm_device)
+    suffix_ids = tokenizer(ps[1].strip(), add_special_tokens=False, truncation=True, return_tensors="pt").input_ids.to(llm_device)
 
     # ========================================================================
-    # PHASE 1: Extract embeddings + Select top-1 EEG per image
+    # PHASE 1: Extract embeddings + Average all EEG repetitions per image
     # ========================================================================
     print("\n" + "="*60)
-    print("PHASE 1: Extracting embeddings and selecting top-1 EEG per image...")
+    print("PHASE 1: Extracting embeddings and averaging all EEG repetitions per image...")
     print("="*60)
     
     # Dictionary to store all data grouped by image_id
@@ -163,37 +167,33 @@ def main():
     print(f"Total unique images: {len(image_groups)}")
     print(f"EEG repetitions per image (sample): {len(image_groups[list(image_groups.keys())[0]]['eeg_embeddings'])}")
     
-    # Select top-1 EEG embedding per image using cosine similarity
+    # Average all EEG embeddings per image
     selected_data = []
     
-    for img_id, data in tqdm(image_groups.items(), desc="Top-1 selection"):
-        # Stack all EEG embeddings for this image [80, ...]
+    for img_id, data in tqdm(image_groups.items(), desc="Averaging EEG embeddings"):
+        # Stack all EEG embeddings for this image [80, batch, ...]
         eeg_stack = torch.cat(data['eeg_embeddings'], dim=0)
-        image_emb = data['image_embedding']
         
-        # Normalize for cosine similarity
-        eeg_norm = torch.nn.functional.normalize(eeg_stack, p=2, dim=-1)
-        img_norm = torch.nn.functional.normalize(image_emb, p=2, dim=-1)
+        # Compute average EEG embedding across all repetitions
+        avg_eeg_embedding = torch.mean(eeg_stack, dim=0, keepdim=True)
         
-        # Compute cosine similarity [80]
-        similarities = torch.matmul(eeg_norm, img_norm.T).squeeze()
+        # Compute cosine similarity between averaged EEG and image embedding
+        eeg_norm = torch.nn.functional.normalize(avg_eeg_embedding, p=2, dim=-1)
+        img_norm = torch.nn.functional.normalize(data['image_embedding'], p=2, dim=-1)
+        avg_similarity = torch.matmul(eeg_norm, img_norm.T).squeeze().item()
         
-        # Get top-1 index
-        top1_idx = torch.argmax(similarities).item()
-        top1_similarity = similarities[top1_idx].item()
-        
-        # Store selected EEG embedding and metadata
+        # Store averaged EEG embedding and metadata
         selected_data.append({
             'image_id': img_id,
-            'eeg_embedding': data['eeg_embeddings'][top1_idx],
-            'image_embedding': image_emb,
+            'eeg_embedding': avg_eeg_embedding,
+            'image_embedding': data['image_embedding'],
             'label_string': data['label_string'],
             'caption_raw': data['caption_raw'],
             'image_path': data['image_path'],
-            'similarity_score': top1_similarity,
+            'similarity_score': avg_similarity,
         })
     
-    print(f"Selected {len(selected_data)} EEG embeddings (1 per image)")
+    print(f"Averaged {len(selected_data)} EEG embeddings (1 per image)")
     
     # ========================================================================
     # PHASE 2: Generate Stage 2 captions (Image → Stage 2 Projector → LLM)
@@ -217,16 +217,23 @@ def main():
     logger.info(f"Loading Stage 2 projector from {stage2_projector_path}")
     model.mm_proj.load_state_dict(torch.load(stage2_projector_path, map_location=args.device))
     
+    # Clear GPU cache before starting generation
+    torch.cuda.empty_cache()
+    
     for item in tqdm(selected_data, desc="Stage 2 captions", position=0, leave=True, dynamic_ncols=True):
         with torch.no_grad():
+            # Normalize image embedding to match training (unit vector)
+            # Move to LLM device to avoid slow transfers during generation
+            image_emb_norm = F.normalize(item['image_embedding'], p=2, dim=1).to(llm_device)
+            
             # Compute and store projected image embedding (before projector swap)
-            projected_image_emb = model.mm_proj(item['image_embedding'])
+            projected_image_emb = model.mm_proj(image_emb_norm.to(args.device))
             item['projected_image_embedding'] = projected_image_emb
             
             output_ids_stage2, _ = model.generate(
                 input_ids1=prefix_ids,
                 input_ids2=suffix_ids,
-                mm_embeds=item['image_embedding'],
+                mm_embeds=image_emb_norm,
                 max_new_tokens=max_len,
                 repetition_penalty=1.1
             )
@@ -244,21 +251,28 @@ def main():
     stage3_projector_path = os.path.join(args.model_path, "projector.pth")
     model.mm_proj.load_state_dict(torch.load(stage3_projector_path, map_location=args.device))
     
+    # Clear GPU cache before Phase 3
+    torch.cuda.empty_cache()
+    
     for item in tqdm(selected_data, desc="Stage 3 captions", position=0, leave=True, dynamic_ncols=True):
         with torch.no_grad():
+            # Normalize EEG embedding to match training (unit vector)
+            # Move to LLM device to avoid slow transfers during generation
+            eeg_emb_norm = F.normalize(item['eeg_embedding'], p=2, dim=1).to(llm_device)
+            
             # Compute projected EEG embedding (with Stage 3 projector loaded)
-            projected_eeg_emb = model.mm_proj(item['eeg_embedding'])
+            projected_eeg_emb = model.mm_proj(eeg_emb_norm.to(args.device))
             
             # Compute cosine similarity between projected embeddings
             proj_img_norm = F.normalize(item['projected_image_embedding'], p=2, dim=-1)
             proj_eeg_norm = F.normalize(projected_eeg_emb, p=2, dim=-1)
             projected_cosine = F.cosine_similarity(proj_img_norm, proj_eeg_norm, dim=-1)
-            item['projected_embedding_similarity'] = projected_cosine.item()
+            item['projected_embedding_similarity'] = projected_cosine.mean().item()
             
             output_ids_stage3, _ = model.generate(
                 input_ids1=prefix_ids,
                 input_ids2=suffix_ids,
-                mm_embeds=item['eeg_embedding'],
+                mm_embeds=eeg_emb_norm,
                 max_new_tokens=max_len,
                 repetition_penalty=1.1
             )
@@ -274,29 +288,39 @@ def main():
     
     for item in tqdm(selected_data, desc="Caption embeddings", position=0, leave=True, dynamic_ncols=True):
         with torch.no_grad():
-            # Tokenize both captions without chat template (raw text only)
+            # Tokenize all captions without chat template (raw text only)
+            caption_gt = item['caption_raw'].replace("<s>", "").replace("</s>", "")
             caption2_tokens = tokenizer(item['caption_stage2'], return_tensors="pt", padding=False, add_special_tokens=False)
             caption3_tokens = tokenizer(item['caption_stage3'], return_tensors="pt", padding=False, add_special_tokens=False)
+            caption_gt_tokens = tokenizer(caption_gt, return_tensors="pt", padding=False, add_special_tokens=False)
             
             caption2_ids = caption2_tokens.input_ids.to(args.device)
             caption3_ids = caption3_tokens.input_ids.to(args.device)
+            caption_gt_ids = caption_gt_tokens.input_ids.to(args.device)
             
-            # Get LLM hidden states for both captions
+            # Get LLM hidden states for all captions
             outputs2 = model.llm(input_ids=caption2_ids, output_hidden_states=True)
             outputs3 = model.llm(input_ids=caption3_ids, output_hidden_states=True)
+            outputs_gt = model.llm(input_ids=caption_gt_ids, output_hidden_states=True)
             
             # Extract last hidden state [batch, seq_len, hidden_dim]
             hidden2 = outputs2.hidden_states[-1]  # Last layer
             hidden3 = outputs3.hidden_states[-1]
+            hidden_gt = outputs_gt.hidden_states[-1]
             
             # Use EOS / last non-pad token pooling (following model.py attention mask logic)
             # Since we used padding=False, the last token is always valid
             emb2 = hidden2[0, -1, :]  # [hidden_dim]
             emb3 = hidden3[0, -1, :]  # [hidden_dim]
+            emb_gt = hidden_gt[0, -1, :]  # [hidden_dim]
             
-            # Compute cosine similarity between caption embeddings
-            caption_cosine = F.cosine_similarity(emb2.unsqueeze(0), emb3.unsqueeze(0), dim=-1)
-            item['caption_semantic_similarity'] = caption_cosine.item()
+            # Compute cosine similarity between caption embeddings (Stage 2 vs Stage 3)
+            caption_cosine_2_3 = F.cosine_similarity(emb2.unsqueeze(0), emb3.unsqueeze(0), dim=-1)
+            item['caption_semantic_similarity'] = caption_cosine_2_3.item()
+            
+            # Compute cosine similarity between ground truth and Stage 3
+            caption_cosine_gt_3 = F.cosine_similarity(emb_gt.unsqueeze(0), emb3.unsqueeze(0), dim=-1)
+            item['caption_semantic_similarity_gt_stage3'] = caption_cosine_gt_3.item()
     
     # ========================================================================
     # PHASE 5: Save results to CSV
@@ -316,7 +340,8 @@ def main():
             "Stage 3 Caption (EEG)": item['caption_stage3'],
             "Cosine": item['similarity_score'],
             "Projected Cosine": item['projected_embedding_similarity'],
-            "LLM EOS cosine": item['caption_semantic_similarity'],
+            "2_3_EOS": item['caption_semantic_similarity'],
+            "GT_3_EOS": item['caption_semantic_similarity_gt_stage3'],
         }
         all_data.append(data)
     
