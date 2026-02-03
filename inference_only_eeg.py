@@ -1,6 +1,4 @@
-# Program for fine tuning eeg_encoder through image embeddings and contrastive loss
-# sample command:
-
+# EEG-based image captioning inference with averaged EEG embeddings
 
 import random
 import logging
@@ -19,8 +17,10 @@ from args import get_args_for_llm_inference
 from model import EEGModelForCausalLM
 from datautils import EEGInferenceDataset, SplitterInference
 from torch.utils.data import DataLoader
-from transformers import AutoTokenizer, BitsAndBytesConfig
+from transformers import AutoTokenizer
 import pandas as pd
+import torch.nn as nn
+import torch.nn.functional as F
 
 
 logging.basicConfig()
@@ -30,18 +30,13 @@ logger.setLevel(logging.INFO)
 
 def set_seed(seed):
     """Set seed for reproducibility"""
-    # Set seed for Python's built-in random module
     random.seed(seed)
-
-    # Set seed for numpy
     np.random.seed(seed)
-
-    # Set seed for PyTorch
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)  # if you are using multi-GPU
+    torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False  # disable to ensure reproducibility
+    torch.backends.cudnn.benchmark = False
 
 
 def main():
@@ -62,116 +57,299 @@ def main():
             ]
     text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     
-    max_len = 100
+    max_len = 40  # Reduced from 100 - one sentence doesn't need 100 tokens
 
     print("Loading model...")
-
-    model = EEGModelForCausalLM.from_pretrained(
-        pretrained_model_name_or_path=args.model_path
+    
+    # Load encoder path
+    if args.eeg_encoder_path:
+        eeg_encoder_path = args.eeg_encoder_path
+    else:
+        with open(os.path.join(args.model_path, "training_config.json")) as f:
+            eeg_encoder_path = json.load(f)["eeg_encoder_path"]
+    
+    projector_path = os.path.join(args.model_path, "projector.pth")
+    
+    print(f"\n{'='*60}")
+    print(f"Loading Model Components:")
+    print(f"  EEG Encoder:  {eeg_encoder_path}")
+    print(f"  Projector:    {projector_path}")
+    print(f"  LLM:          {args.llm_backbone_name_or_path}")
+    print(f"{'='*60}\n")
+    
+    model = EEGModelForCausalLM.from_separate_pretrained(
+        eeg_encoder_path=eeg_encoder_path,
+        llm_path=args.llm_backbone_name_or_path,
+        use_lora=False,
+        llm_low_cpu_mem_usage=True,
+        # llm_load_in_8bit=True,  # Disabled - bitsandbytes not working
     )
-
-    # For stage 3, we only train the mm_projector, everything else is static
+    
     model.eeg_encoder.to(args.device)
     model.mm_proj.to(args.device)
-    model.eval()
+    model.eval()  # LLM device handled by accelerate
+    
+    # Set pad_token_id in generation config to suppress warnings
+    model.llm.generation_config.pad_token_id = tokenizer.pad_token_id
+    
+    # Log actual device placement
+    logger.info(f"EEG encoder device: {next(model.eeg_encoder.parameters()).device}")
+    logger.info(f"Projector device: {next(model.mm_proj.parameters()).device}")
+    logger.info(f"LLM device: {next(model.llm.parameters()).device}")
+
+    # Load precomputed image embeddings
+    embeddings_path = "/zhome/73/b/145313/thesis/data/images/image_embeddings_list.pth"
+    logger.info(f"Loading precomputed image embeddings from {embeddings_path}")
+    precomputed_embeddings = torch.load(embeddings_path, weights_only=False)
 
     # Load precomputed captions (required)
     captions_path = "/zhome/73/b/145313/thesis/data/images/captions_list.pth"  # User must change this
-    if not os.path.exists(captions_path):
-        raise FileNotFoundError(
-            f"Ground Truth captions not found at {captions_path}. "
-            "Please provide valid captions file."
-        )
     logger.info(f"Loading ground truth captions from {captions_path}")
     captions = torch.load(captions_path, weights_only=False)
 
-    dataset = EEGInferenceDataset(
-        args=args,
-        captions=captions,
+    dataset = EEGInferenceDataset(args=args, captions=captions)
+    test_dataloader = DataLoader(
+        SplitterInference(
+            dataset,
+            split_path=args.splits_path,
+            split_num=args.split_num,
+            split_name="test",
+        ),
+        batch_size=1,
+        drop_last=True,
+        shuffle=False,  # Don't shuffle for reproducibility
     )
-    loaders = {
-        split: DataLoader(
-            SplitterInference(
-                dataset,
-                split_path=args.splits_path,
-                split_num=args.split_num,
-                split_name=split,
-            ),
-            batch_size=1,
-            drop_last=True,
-            shuffle=True,
-        )
-        for split in ["train", "val", "test"]
-    }
-    test_dataloader = loaders["test"]
 
-    all_data = []
+    # Prepare text prompt tokens (used by both Stage 2 and Stage 3)
+    ps = text.split("<image>")
+    # Get LLM device to avoid slow transfers during generation
+    llm_device = next(model.llm.parameters()).device
+    logger.info(f"Moving prompt tokens to LLM device: {llm_device}")
+    prefix_ids = tokenizer(ps[0], add_special_tokens=False, truncation=True, return_tensors="pt").input_ids.to(llm_device)
+    suffix_ids = tokenizer(ps[1].strip(), add_special_tokens=False, truncation=True, return_tensors="pt").input_ids.to(llm_device)
 
-        
-
-    for batch in tqdm(test_dataloader):
+    # ========================================================================
+    # PHASE 1: Extract embeddings + Average all EEG repetitions per image
+    # ========================================================================
+    print("\n" + "="*60)
+    print("PHASE 1: Extracting embeddings and averaging all EEG repetitions per image...")
+    print("="*60)
+    
+    # Dictionary to store all data grouped by image_id
+    image_groups = {}
+    
+    for batch in tqdm(test_dataloader, desc="Extracting embeddings"):
         eeg, label_string, caption_raw, image_path, image_id = batch
         eeg = eeg.to(args.device)
-        # In encode_only mode, use encode() method to get only embeddings (no classifier output)
-        emb_out = model.eeg_encoder.encode(eeg)
-
-        batched_input_ids1 = []
-        batched_input_ids2 = []
-
-        batch_data = []
-
-        for i, exp_label in enumerate(label_string):
-            data = {}
-            data["Ground Truth Image"] = image_path[i]
-            data["Expected object"] = exp_label
-            data["Image ID"] = image_id[i].item() if torch.is_tensor(image_id[i]) else image_id[i]
-            batch_data.append(data)
-            new_text = text
-            ps = new_text.split("<image>")
-            prefix = ps[0]
-            suffix = ps[1]
-            individual_input_ids1 = tokenizer(
-                prefix,
-                add_special_tokens=False,
-                truncation=True,
-                return_tensors="pt",
-            ).input_ids
-            individual_input_ids2 = tokenizer(
-                suffix.strip(),
-                add_special_tokens=False,
-                truncation=True,
-                return_tensors="pt",
-            ).input_ids
-
-            individual_input_ids1 = individual_input_ids1.squeeze(0)
-            individual_input_ids2 = individual_input_ids2.squeeze(0)
-            batched_input_ids1.append(individual_input_ids1)
-            batched_input_ids2.append(individual_input_ids2)
-
-        batched_input_ids1 = torch.stack(batched_input_ids1)
-        batched_input_ids2 = torch.stack(batched_input_ids2)
-
-        output_ids, labels_gen = model.generate(
-            input_ids1=batched_input_ids1,
-            input_ids2=batched_input_ids2,
-            mm_embeds=emb_out,
-            max_new_tokens=max_len,
-            repetition_penalty=1.1
-        )
-        output_text = tokenizer.batch_decode(output_ids, skip_special_tokens=True)
-
-        for j, output in enumerate(output_text):
-            print("Output generated:", output)
-            print("Expected caption:", caption_raw[j])
-            batch_data[j]["Expected Caption"] = (
-                caption_raw[j].replace("<s>", "").replace("</s>", "")
+        
+        # Encode EEG to get embeddings
+        with torch.no_grad():
+            eeg_embeddings = model.eeg_encoder.encode(eeg)
+        
+        # Get the actual image_id value
+        img_id = image_id[0].item() if torch.is_tensor(image_id[0]) else image_id[0]
+        
+        # Get image embedding
+        image_embedding = precomputed_embeddings[image_id].to(args.device)
+        
+        # Group by image_id
+        if img_id not in image_groups:
+            image_groups[img_id] = {
+                'eeg_embeddings': [],
+                'image_embedding': image_embedding,
+                'label_string': label_string[0],
+                'caption_raw': caption_raw[0],
+                'image_path': image_path[0]
+            }
+        
+        image_groups[img_id]['eeg_embeddings'].append(eeg_embeddings)
+    
+    print(f"Total unique images: {len(image_groups)}")
+    print(f"EEG repetitions per image (sample): {len(image_groups[list(image_groups.keys())[0]]['eeg_embeddings'])}")
+    
+    # Average all EEG embeddings per image
+    selected_data = []
+    
+    for img_id, data in tqdm(image_groups.items(), desc="Averaging EEG embeddings"):
+        # Stack all EEG embeddings for this image [80, batch, ...]
+        eeg_stack = torch.cat(data['eeg_embeddings'], dim=0)
+        
+        # Compute average EEG embedding across all repetitions
+        avg_eeg_embedding = torch.mean(eeg_stack, dim=0, keepdim=True)
+        
+        # Compute cosine similarity between averaged EEG and image embedding
+        eeg_norm = torch.nn.functional.normalize(avg_eeg_embedding, p=2, dim=-1)
+        img_norm = torch.nn.functional.normalize(data['image_embedding'], p=2, dim=-1)
+        avg_similarity = torch.matmul(eeg_norm, img_norm.T).squeeze().item()
+        
+        # Store averaged EEG embedding and metadata
+        selected_data.append({
+            'image_id': img_id,
+            'eeg_embedding': avg_eeg_embedding,
+            'image_embedding': data['image_embedding'],
+            'label_string': data['label_string'],
+            'caption_raw': data['caption_raw'],
+            'image_path': data['image_path'],
+            'similarity_score': avg_similarity,
+        })
+    
+    print(f"Averaged {len(selected_data)} EEG embeddings (1 per image)")
+    
+    # ========================================================================
+    # PHASE 2: Generate Stage 2 captions (Image → Stage 2 Projector → LLM)
+    # ========================================================================
+    print("\n" + "="*60)
+    print("PHASE 2: Generating Stage 2 captions (Image embeddings)...")
+    print("="*60)
+    
+    # Load Stage 2 projector
+    # Extract model name from either HuggingFace ID or cache path
+    if "models--" in args.llm_backbone_name_or_path:
+        # Cache path format: .../models--org--model/snapshots/hash
+        # Extract "model" from "models--org--model"
+        parts = args.llm_backbone_name_or_path.split("/")
+        model_dir = [p for p in parts if p.startswith("models--")][0]
+        llm_name = model_dir.split("--")[-1]  # Get last part after splitting by --
+    else:
+        # HuggingFace ID format: org/model
+        llm_name = args.llm_backbone_name_or_path.split("/")[-1]
+    stage2_projector_path = f"/zhome/73/b/145313/Thought2Text/data/runs/{llm_name}/projector.pth"
+    logger.info(f"Loading Stage 2 projector from {stage2_projector_path}")
+    model.mm_proj.load_state_dict(torch.load(stage2_projector_path, map_location=args.device))
+    
+    # Clear GPU cache before starting generation
+    torch.cuda.empty_cache()
+    
+    for item in tqdm(selected_data, desc="Stage 2 captions", position=0, leave=True, dynamic_ncols=True):
+        with torch.no_grad():
+            # Normalize image embedding to match training (unit vector)
+            # Move to LLM device to avoid slow transfers during generation
+            image_emb_norm = F.normalize(item['image_embedding'], p=2, dim=1).to(llm_device)
+            
+            # Compute and store projected image embedding (before projector swap)
+            projected_image_emb = model.mm_proj(image_emb_norm.to(args.device))
+            item['projected_image_embedding'] = projected_image_emb
+            
+            output_ids_stage2, _ = model.generate(
+                input_ids1=prefix_ids,
+                input_ids2=suffix_ids,
+                mm_embeds=image_emb_norm,
+                max_new_tokens=max_len,
+                repetition_penalty=1.1
             )
-            batch_data[j]["Generated Caption"] = output
-            # print(labels_gen[j].shape)
-            # print("Label gen", tokenizer.batch_decode(labels_gen[j].unsqueeze(0)))
-        all_data += batch_data
+        caption_stage2 = tokenizer.batch_decode(output_ids_stage2, skip_special_tokens=True)[0]
+        item['caption_stage2'] = caption_stage2
+    
+    # ========================================================================
+    # PHASE 3: Generate Stage 3 captions (EEG → Stage 3 Projector → LLM)
+    # ========================================================================
+    print("\n" + "="*60)
+    print("PHASE 3: Generating Stage 3 captions (EEG embeddings)...")
+    print("="*60)
+    
+    # Swap to Stage 3 projector
+    stage3_projector_path = os.path.join(args.model_path, "projector.pth")
+    model.mm_proj.load_state_dict(torch.load(stage3_projector_path, map_location=args.device))
+    
+    # Clear GPU cache before Phase 3
+    torch.cuda.empty_cache()
+    
+    for item in tqdm(selected_data, desc="Stage 3 captions", position=0, leave=True, dynamic_ncols=True):
+        with torch.no_grad():
+            # Normalize EEG embedding to match training (unit vector)
+            # Move to LLM device to avoid slow transfers during generation
+            eeg_emb_norm = F.normalize(item['eeg_embedding'], p=2, dim=1).to(llm_device)
+            
+            # Compute projected EEG embedding (with Stage 3 projector loaded)
+            projected_eeg_emb = model.mm_proj(eeg_emb_norm.to(args.device))
+            
+            # Compute cosine similarity between projected embeddings
+            proj_img_norm = F.normalize(item['projected_image_embedding'], p=2, dim=-1)
+            proj_eeg_norm = F.normalize(projected_eeg_emb, p=2, dim=-1)
+            projected_cosine = F.cosine_similarity(proj_img_norm, proj_eeg_norm, dim=-1)
+            item['projected_embedding_similarity'] = projected_cosine.mean().item()
+            
+            output_ids_stage3, _ = model.generate(
+                input_ids1=prefix_ids,
+                input_ids2=suffix_ids,
+                mm_embeds=eeg_emb_norm,
+                max_new_tokens=max_len,
+                repetition_penalty=1.1
+            )
+        caption_stage3 = tokenizer.batch_decode(output_ids_stage3, skip_special_tokens=True)[0]
+        item['caption_stage3'] = caption_stage3
+    
+    # ========================================================================
+    # PHASE 4: Compute caption semantic similarity using LLM embeddings
+    # ========================================================================
+    print("\n" + "="*60)
+    print("PHASE 4: Computing caption semantic similarity...")
+    print("="*60)
+    
+    for item in tqdm(selected_data, desc="Caption embeddings", position=0, leave=True, dynamic_ncols=True):
+        with torch.no_grad():
+            # Tokenize all captions without chat template (raw text only)
+            caption_gt = item['caption_raw'].replace("<s>", "").replace("</s>", "")
+            caption2_tokens = tokenizer(item['caption_stage2'], return_tensors="pt", padding=False, add_special_tokens=False)
+            caption3_tokens = tokenizer(item['caption_stage3'], return_tensors="pt", padding=False, add_special_tokens=False)
+            caption_gt_tokens = tokenizer(caption_gt, return_tensors="pt", padding=False, add_special_tokens=False)
+            
+            caption2_ids = caption2_tokens.input_ids.to(args.device)
+            caption3_ids = caption3_tokens.input_ids.to(args.device)
+            caption_gt_ids = caption_gt_tokens.input_ids.to(args.device)
+            
+            # Get LLM hidden states for all captions
+            outputs2 = model.llm(input_ids=caption2_ids, output_hidden_states=True)
+            outputs3 = model.llm(input_ids=caption3_ids, output_hidden_states=True)
+            outputs_gt = model.llm(input_ids=caption_gt_ids, output_hidden_states=True)
+            
+            # Extract last hidden state [batch, seq_len, hidden_dim]
+            hidden2 = outputs2.hidden_states[-1]  # Last layer
+            hidden3 = outputs3.hidden_states[-1]
+            hidden_gt = outputs_gt.hidden_states[-1]
+            
+            # Use EOS / last non-pad token pooling (following model.py attention mask logic)
+            # Since we used padding=False, the last token is always valid
+            emb2 = hidden2[0, -1, :]  # [hidden_dim]
+            emb3 = hidden3[0, -1, :]  # [hidden_dim]
+            emb_gt = hidden_gt[0, -1, :]  # [hidden_dim]
+            
+            # Compute cosine similarity between caption embeddings (Stage 2 vs Stage 3)
+            caption_cosine_2_3 = F.cosine_similarity(emb2.unsqueeze(0), emb3.unsqueeze(0), dim=-1)
+            item['caption_semantic_similarity'] = caption_cosine_2_3.item()
+            
+            # Compute cosine similarity between ground truth and Stage 3
+            caption_cosine_gt_3 = F.cosine_similarity(emb_gt.unsqueeze(0), emb3.unsqueeze(0), dim=-1)
+            item['caption_semantic_similarity_gt_stage3'] = caption_cosine_gt_3.item()
+    
+    # ========================================================================
+    # PHASE 5: Save results to CSV
+    # ========================================================================
+    print("\n" + "="*60)
+    print("PHASE 5: Saving results to CSV...")
+    print("="*60)
+    
+    all_data = []
+    for item in selected_data:
+        data = {
+            "Image ID": item['image_id'],
+            "Ground Truth Image": item['image_path'],
+            "Expected object": item['label_string'],
+            "Expected Caption": item['caption_raw'].replace("<s>", "").replace("</s>", ""),
+            "Stage 2 Caption (Image)": item['caption_stage2'],
+            "Stage 3 Caption (EEG)": item['caption_stage3'],
+            "Cosine": item['similarity_score'],
+            "Projected Cosine": item['projected_embedding_similarity'],
+            "2_3_EOS": item['caption_semantic_similarity'],
+            "GT_3_EOS": item['caption_semantic_similarity_gt_stage3'],
+        }
+        all_data.append(data)
+    
     df = pd.DataFrame(all_data)
-    df.to_csv(args.dest)
+    df.to_csv(args.dest, index=False)
+    print(f"Results saved to: {args.dest}")
+    print(f"Total rows: {len(df)}")
+    print("="*60)
 
 
 if __name__ == "__main__":

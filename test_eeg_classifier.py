@@ -96,19 +96,13 @@ def main():
         # Get image embeddings directly from precomputed using unique_image_ids
         img_raw_avg = precomputed_embeddings[unique_image_ids]  # [200, embedding_dim]
         
-        # Compute image space mean (CLIP reference space) from test set
-        img_global_mean = img_raw_avg.mean(dim=0)
-        
-        # Center both modalities using CLIP image space mean (reference space)
-        # This preserves any global bias/shift in EEG embeddings for diagnostic purposes
-        eeg_centered = eeg_raw_avg - img_global_mean.cpu()
-        img_centered = img_raw_avg - img_global_mean.cpu()
-        eeg_norm = eeg_centered / (eeg_centered.norm(p=2, dim=1, keepdim=True) + 1e-8)
-        img_norm = img_centered / (img_centered.norm(p=2, dim=1, keepdim=True) + 1e-8)
+        # Normalize both modalities (without centering)
+        eeg_norm = eeg_raw_avg / (eeg_raw_avg.norm(p=2, dim=1, keepdim=True) + 1e-8)
+        img_norm = img_raw_avg / (img_raw_avg.norm(p=2, dim=1, keepdim=True) + 1e-8)
         
         # Compute diagonal metrics (matching image pairs)
         avg_cosines = F.cosine_similarity(eeg_norm, img_norm, dim=1).numpy()
-        avg_mses = F.mse_loss(eeg_raw_avg, img_raw_avg, reduction='none').mean(dim=1).numpy()
+        avg_mses = F.mse_loss(eeg_norm, img_norm, reduction='none').mean(dim=1).numpy()
         
         # Save diagonal metrics to the checkpoint directory
         save_dir = args.output + '/results'
@@ -119,26 +113,26 @@ def main():
         
         # Print overall statistics
         print(f"\nOverall statistics across {len(unique_image_ids)} unique images:")
-        print(f"  Average Centered Cosine Similarity: {avg_cosines.mean():.4f} ± {avg_cosines.std():.4f}")
-        print(f"  Average MSE: {avg_mses.mean():.4f} ± {avg_mses.std():.4f}")
+        print(f"  Average Cosine Similarity (Normalized): {avg_cosines.mean():.4f} ± {avg_cosines.std():.4f}")
+        print(f"  Average MSE (Normalized): {avg_mses.mean():.4f} ± {avg_mses.std():.4f}")
         
         # Compute full 200x200 similarity matrices
         print("\nComputing 200x200 matrices...")
         cosine_matrix = torch.mm(eeg_norm, img_norm.t()).numpy()  # [200, 200]
         
-        # Compute MSE matrix efficiently using broadcasting
-        eeg_expanded = eeg_raw_avg.unsqueeze(1)  # [200, 1, dim]
-        img_expanded = img_raw_avg.unsqueeze(0)  # [1, 200, dim]
+        # Compute MSE matrix efficiently using broadcasting (with normalized embeddings)
+        eeg_expanded = eeg_norm.unsqueeze(1)  # [200, 1, dim]
+        img_expanded = img_norm.unsqueeze(0)  # [1, 200, dim]
         mse_matrix = ((eeg_expanded - img_expanded) ** 2).mean(dim=2).numpy()  # [200, 200]
         
         # Create 200x200 heatmaps
         print("\nCreating visualizations...")
         plt.figure(figsize=(12, 10))
         sns.heatmap(cosine_matrix, annot=False, cmap='RdYlGn', center=0, 
-                    cbar_kws={'label': 'Average Cosine Similarity'}, square=True)
-        plt.title(f'Average Cosine Heatmap (All Subjects)\n(Averaged across {len(eeg_raw_per_image[unique_image_ids[0]])} repetitions per image)')
-        plt.xlabel('CLIP Target Embeddings')
-        plt.ylabel('EEG Trained Embeddings')
+                    cbar_kws={'label': 'Cosine Similarity (Normalized)'}, square=True)
+        plt.title(f'Cosine Similarity Heatmap - Normalized Embeddings\n(Averaged across {len(eeg_raw_per_image[unique_image_ids[0]])} repetitions per image)')
+        plt.xlabel('CLIP Target Embeddings (Normalized)')
+        plt.ylabel('EEG Trained Embeddings (Normalized)')
         plt.tight_layout()
         cosine_heatmap_path = os.path.join(save_dir, "cosine_similarity_heatmap.png")
         plt.savefig(cosine_heatmap_path, dpi=300, bbox_inches='tight')
@@ -148,10 +142,10 @@ def main():
         # MSE heatmap
         plt.figure(figsize=(12, 10))
         sns.heatmap(mse_matrix, annot=False, cmap='RdYlGn_r', 
-                    cbar_kws={'label': 'MSE (lower is better)'}, square=True)
-        plt.title(f'MSE Heatmap\n(Averaged across {len(eeg_raw_per_image[unique_image_ids[0]])} repetitions per image)')
-        plt.xlabel('CLIP Target Embeddings')
-        plt.ylabel('EEG Trained Embeddings')
+                    cbar_kws={'label': 'MSE (Normalized, lower is better)'}, square=True)
+        plt.title(f'MSE Heatmap - Normalized Embeddings\n(Averaged across {len(eeg_raw_per_image[unique_image_ids[0]])} repetitions per image)')
+        plt.xlabel('CLIP Target Embeddings (Normalized)')
+        plt.ylabel('EEG Trained Embeddings (Normalized)')
         plt.tight_layout()
         mse_heatmap_path = os.path.join(save_dir, "mse_heatmap.png")
         plt.savefig(mse_heatmap_path, dpi=300, bbox_inches='tight')
@@ -162,17 +156,17 @@ def main():
         fig, axes = plt.subplots(1, 2, figsize=(14, 5))
         
         axes[0].hist(cosine_matrix.diagonal(), bins=30, edgecolor='black')
-        axes[0].set_xlabel('Centered Cosine Similarity (Diagonal)')
+        axes[0].set_xlabel('Cosine Similarity (Normalized, Diagonal)')
         axes[0].set_ylabel('Frequency')
-        axes[0].set_title(f'Distribution of Centered Cosine Similarity\n(n={len(unique_image_ids)} images)')
+        axes[0].set_title(f'Distribution of Cosine Similarity - Normalized\n(n={len(unique_image_ids)} images)')
         axes[0].axvline(cosine_matrix.diagonal().mean(), color='red', linestyle='--', 
                        label=f'Mean: {cosine_matrix.diagonal().mean():.4f}')
         axes[0].legend()
         
         axes[1].hist(mse_matrix.diagonal(), bins=30, edgecolor='black')
-        axes[1].set_xlabel('MSE (Diagonal)')
+        axes[1].set_xlabel('MSE (Normalized, Diagonal)')
         axes[1].set_ylabel('Frequency')
-        axes[1].set_title(f'Distribution of MSE\n(n={len(unique_image_ids)} images)')
+        axes[1].set_title(f'Distribution of MSE - Normalized\n(n={len(unique_image_ids)} images)')
         axes[1].axvline(mse_matrix.diagonal().mean(), color='red', linestyle='--', 
                        label=f'Mean: {mse_matrix.diagonal().mean():.4f}')
         axes[1].legend()
@@ -182,34 +176,65 @@ def main():
         plt.savefig(dist_path, dpi=300, bbox_inches='tight')
         print(f"Saved metrics distributions to {dist_path}")
         plt.close()
-    else:
-        # Classification mode: compute accuracy
-        print("Running in classification mode")
-        metric = evaluate.load("accuracy")
-        softmax = torch.nn.Softmax(dim=1)
-        all_labels = []
-        all_preds = []
         
-        for batch in tqdm(test_loader, desc="Computing predictions"):
-            # Try unpacking with image_ids first, fallback to 3-tuple
-            if len(batch) == 4:
-                image_raw, eeg_data, labels, image_ids = batch
-            else:
-                image_raw, eeg_data, labels = batch
-            
-            image_raw = image_raw.to(args.device)
-            eeg_data = eeg_data.to(args.device)
-            labels = labels.to(args.device)
-
-            with torch.no_grad():
-                emb_output, cls_output = model(eeg_data)
-                preds = softmax(cls_output).argmax(dim=1)
-            
-            all_labels.extend(labels.cpu().tolist())
-            all_preds.extend(preds.cpu().tolist())
+        # Create categorized heatmap
+        print("\nCreating categorized heatmap...")
+        categories_path = "/zhome/73/b/145313/thesis/data/images/test_super_cat_list.pth"
+        categories = torch.load(categories_path, map_location="cpu")
         
-        test_metric = metric.compute(predictions=all_preds, references=all_labels)
-        print({"test_acc": test_metric["accuracy"]})
+        # Sort by category
+        sorted_indices = sorted(range(len(categories)), key=lambda i: (categories[i], i))
+        sorted_categories = [categories[i] for i in sorted_indices]
+        
+        # Reorder matrices
+        cosine_sorted = cosine_matrix[sorted_indices, :][:, sorted_indices]
+        
+        # Find category boundaries
+        boundaries = []
+        category_centers = []
+        current_cat = sorted_categories[0]
+        start_idx = 0
+        
+        for i in range(1, len(sorted_categories)):
+            if sorted_categories[i] != current_cat:
+                boundaries.append(i)
+                category_centers.append((start_idx + i) / 2)
+                start_idx = i
+                current_cat = sorted_categories[i]
+        category_centers.append((start_idx + len(sorted_categories)) / 2)
+        
+        # Get unique categories in order
+        unique_cats = []
+        for cat in sorted_categories:
+            if cat not in unique_cats:
+                unique_cats.append(cat)
+        
+        # Create categorized heatmap
+        fig, ax = plt.subplots(figsize=(14, 12))
+        sns.heatmap(cosine_sorted, annot=False, cmap='RdYlGn', center=0,
+                   cbar_kws={'label': 'Cosine Similarity (Normalized)'}, 
+                   square=True, ax=ax)
+        
+        # Add category separators
+        for boundary in boundaries:
+            ax.axhline(boundary, color='black', linewidth=2)
+            ax.axvline(boundary, color='black', linewidth=2)
+        
+        # Set category labels
+        ax.set_yticks(category_centers)
+        ax.set_yticklabels(unique_cats, rotation=0)
+        ax.set_xticks(category_centers)
+        ax.set_xticklabels(unique_cats, rotation=90)
+        
+        ax.set_ylabel('EEG Trained Embeddings')
+        ax.set_xlabel('CLIP Target Embeddings')
+        plt.title(f'Categorized Cosine Similarity Heatmap\n(Averaged across {len(eeg_raw_per_image[unique_image_ids[0]])} repetitions per image)')
+        plt.tight_layout()
+        
+        categorized_path = os.path.join(save_dir, "categorized_cosine_heatmap.png")
+        plt.savefig(categorized_path, dpi=300, bbox_inches='tight')
+        print(f"Saved categorized heatmap to {categorized_path}")
+        plt.close()
 
 
 if __name__ == "__main__":

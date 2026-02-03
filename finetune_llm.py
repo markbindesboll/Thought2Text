@@ -19,6 +19,7 @@ import gc
 import random
 import logging
 import torch
+import torch.nn.functional as F
 import numpy as np
 import json
 import copy
@@ -86,6 +87,8 @@ class Stage2Trainer(Trainer):
         if self.precomputed_embeddings is None:
             raise RuntimeError("Precomputed embeddings are required for Stage 2 training")
         image_embeddings = self.precomputed_embeddings[image_ids.cpu()].to(self.device)
+        # Normalize embeddings to ensure consistent magnitude (unit vectors)
+        image_embeddings = torch.nn.functional.normalize(image_embeddings, p=2, dim=1)
         output, labels = model(
             input_ids1=input_ids1, input_ids2=input_ids2, mm_embeds=image_embeddings
         )
@@ -131,6 +134,9 @@ class Stage3Trainer(Trainer):
             ) = inputs
             with torch.no_grad():
                 eeg_embeddings = self.eeg_encoder.encode(eeg)
+        
+        # Normalize embeddings to match Stage 2 training (unit vectors)
+        eeg_embeddings = torch.nn.functional.normalize(eeg_embeddings, p=2, dim=1)
         
         output, labels = model(
             input_ids1=input_ids1, input_ids2=input_ids2, mm_embeds=eeg_embeddings
@@ -178,7 +184,7 @@ def main():
         model.eeg_encoder.to(args.device)
         model.mm_proj.to(args.device)
 
-    model.llm.save_pretrained(os.path.join(args.output, "llm"))
+    # Don't save the full LLM here - we'll load it from cache and only save projector/adapters
     model.train()
     set_gradients(module=model.eeg_encoder, requires_grad=False)
     set_gradients(module=model.llm, requires_grad=False)
@@ -209,30 +215,31 @@ def main():
     
     if not args.no_stage2:
         logger.info("STAGE 2: LLM fine tuning on images")
-        llm_name = args.llm_backbone_name_or_path.split("/")[1]
+        # Extract model name from either HuggingFace ID or cache path
+        if "models--" in args.llm_backbone_name_or_path:
+            # Cache path format: .../models--org--model/snapshots/hash
+            parts = args.llm_backbone_name_or_path.split("/")
+            model_dir = [p for p in parts if p.startswith("models--")][0]
+            llm_name = model_dir.split("--")[-1]  # Get last part after splitting by --
+        else:
+            # HuggingFace ID format: org/model
+            llm_name = args.llm_backbone_name_or_path.split("/")[1]
         pretrained_path = os.path.join(args.saved_pretrained_model_path, llm_name)
-        llm_path = os.path.join(pretrained_path, "llm")
         projector_path = os.path.join(pretrained_path, "projector.pth")
+        lora_path = os.path.join(pretrained_path, "lora_adapters") if args.use_lora else None
         
-        # Check if Stage 2 model actually exists (not just the directory)
-        if os.path.exists(llm_path) and os.path.exists(projector_path):
-            print(f"Stage 2 model found at {pretrained_path}. Loading LLM and projector, using encoder from args.")
-            del model
-            gc.collect()
-            # Load Stage 2 model but use the encoder from args (not from checkpoint)
-            model = EEGModelForCausalLM.from_separate_pretrained(
-                eeg_encoder_path=args.eeg_encoder_path,
-                llm_path=llm_path,
-                use_lora=args.use_lora,
-                llm_low_cpu_mem_usage=True,
-            )
-            # Load the projector weights from Stage 2
+        # Check if Stage 2 trained weights exist (projector required, LoRA optional)
+        stage2_exists = os.path.exists(projector_path) and (not args.use_lora or os.path.exists(lora_path))
+        if stage2_exists:
+            logger.info(f"✓ Stage 2 checkpoint found at {pretrained_path}. Skipping Stage 2 training.")
+            logger.info(f"  Loading trained projector from: {projector_path}")
+            # Just load the trained projector weights - model already has LLM from cache
             model.mm_proj.load_state_dict(torch.load(projector_path))
-            
-            model.eeg_encoder.to(args.device)
-            model.mm_proj.to(args.device)
-            set_gradients(module=model.eeg_encoder, requires_grad=False)
-            model.llm.save_pretrained(llm_path)
+            # Load LoRA adapters if they exist
+            if args.use_lora and os.path.exists(lora_path):
+                logger.info(f"  Loading LoRA adapters from: {lora_path}")
+                model.llm.load_adapter(lora_path)
+            logger.info("✓ Stage 2 weights loaded successfully. Proceeding to Stage 3.")
 
 
         else:           
@@ -285,11 +292,13 @@ def main():
                 precomputed_embeddings=precomputed_embeddings,
             )
             trainer.train()
-            # Save Stage 2: only LLM and projector (not encoder - it's frozen and comes from args)
+            # Save Stage 2: only projector and LoRA adapters (not full LLM - saves 7GB of space!)
             os.makedirs(pretrained_path, exist_ok=True)
             torch.save(model.mm_proj.state_dict(), os.path.join(pretrained_path, "projector.pth"))
-            model.llm.save_pretrained(os.path.join(pretrained_path, "llm"))
+            if args.use_lora:
+                model.llm.save_pretrained(os.path.join(pretrained_path, "lora_adapters"))
             dataset.tokenizer.save_pretrained(pretrained_path)
+            logger.info(f"Stage 2 checkpoint saved to {pretrained_path} (projector only, not full LLM)")
 
             del loaders
             gc.collect()
@@ -375,11 +384,22 @@ def main():
         eeg_encoder=model.eeg_encoder,
     )
     trainer.train()
-    model.save_pretrained(args.output)
+    
+    # Save only trained components (projector + metadata)
+    # Don't duplicate frozen encoder - saves space!
+    logger.info(f"Saving Stage 3 model to {args.output}")
+    model.save_pretrained(args.output, save_encoder=False)
     dataset.tokenizer.save_pretrained(args.output)
     with open(os.path.join(args.output, "id2label.json"), "w") as f:
         json.dump(dataset.id2label, f)
-
+    
+    # Save reference to encoder path for inference
+    with open(os.path.join(args.output, "training_config.json"), "w") as f:
+        json.dump({
+            "eeg_encoder_path": args.eeg_encoder_path,
+            "llm_backbone": args.llm_backbone_name_or_path,
+            "stage1_mode": stage1_mode,
+        }, f, indent=2)
 
 if __name__ == "__main__":
     main()

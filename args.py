@@ -72,7 +72,7 @@ def get_args_for_encoder_training():
     # train args
 
     parser.add_argument(
-        "--batch_size", type=int, default=16, help="Batch size for training."
+        "--batch_size", type=int, default=64, help="Batch size for training."
     )
     parser.add_argument(
         "--num_epochs", type=int, default=100, help="Number of epochs for training."
@@ -88,7 +88,7 @@ def get_args_for_encoder_training():
     )
     parser.add_argument(
         "--learning_rate",
-        default=2e-5,
+        default=3e-4,
         type=float,
         help="The initial learning rate for Adam.",
     )
@@ -99,7 +99,7 @@ def get_args_for_encoder_training():
         help="Optimizer to use for training.",
     )
     parser.add_argument(
-        "--weight_decay", default=0.001, type=float, help="Weight decay to apply."
+        "--weight_decay", default=1e-3, type=float, help="Weight decay to apply."
     )
     parser.add_argument(
         "--max_grad_norm",
@@ -126,9 +126,15 @@ def get_args_for_encoder_training():
     )
     parser.add_argument(
         "--lr_scheduler_type",
-        default="constant",
+        default="cosine",
         type=str,
         help="Type of learning rate scheduler.",
+    )
+    parser.add_argument(
+        "--magnitude_weight",
+        type=float,
+        default=0.0,
+        help="Weight for magnitude/distance preservation loss (0=pure InfoNCE, >0=hybrid with MSE on raw embeddings)",
     )
     # Parse arguments
     args = parser.parse_args()
@@ -188,8 +194,8 @@ def get_args_for_llm_finetuning():
     parser.add_argument(
         "--saved_pretrained_model_path",
         type=str,
-        default="/tmp",
-        help="Directory to load the model checkpoints",
+        default="data/runs",
+        help="Directory to save/load Stage 2 checkpoints (projector + tokenizer, shared across experiments)",
     )
     parser.add_argument("--clip_model", default="openai/clip-vit-base-patch32")
 
@@ -240,7 +246,7 @@ def get_args_for_llm_finetuning():
     )
     parser.add_argument(
         "--learning_rate",
-        default=2e-5,
+        default=1e-3,
         type=float,
         help="The initial learning rate for Adam.",
     )
@@ -328,7 +334,19 @@ def get_args_for_llm_inference():
         "--model_path",
         type=str,
         required=True,
-        help="Directory to load the model checkpoints",
+        help="Directory to load the model checkpoints (EEG encoder and projector)",
+    )
+    parser.add_argument(
+        "--llm_backbone_name_or_path",
+        type=str,
+        default="mistralai/Mistral-7B-Instruct-v0.3",
+        help="HuggingFace model name or path to load base LLM from (use cache path to save space)",
+    )
+    parser.add_argument(
+        "--eeg_encoder_path",
+        type=str,
+        default=None,
+        help="(Optional) Override encoder path. By default, reads from training_config.json in model_path.",
     )
     
     parser.add_argument("--device", type=str, default="cuda:0")

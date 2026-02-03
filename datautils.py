@@ -7,7 +7,6 @@ import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, AutoProcessor
-from constants import label_map, id2label
 
 
 logger = logging.getLogger(__name__)
@@ -16,18 +15,12 @@ logger = logging.getLogger(__name__)
 class EEGDataset:
 
     # Constructor
-    def __init__(self, args, fine_tuning=False):
+    def __init__(self, args):
         self.args = args
         # Load EEG signals
         loaded = torch.load(args.eeg_dataset, weights_only=False)
-        if args.subject != 0:
-            self.data = [
-                loaded["dataset"][i]
-                for i in range(len(loaded["dataset"]))
-                if loaded["dataset"][i]["subject"] == args.subject
-            ]
-        else:
-            self.data = loaded["dataset"]
+
+        self.data = loaded["dataset"]
         
         self.labels = loaded["labels"]
         self.images = loaded["images"]
@@ -40,7 +33,6 @@ class EEGDataset:
 
         # Initialize image processor
         self.processor = AutoProcessor.from_pretrained(args.clip_model)
-        self.fine_tuning = fine_tuning
 
     # Get size
     def __len__(self):
@@ -54,9 +46,11 @@ class EEGDataset:
         #eeg = eeg[self.args.time_low : self.args.time_high, :]
         #eeg = eeg.t()
         eeg = eeg.view(1, len(self.channels), len(self.times))
-        label = self.data[i]["label"]
-        label_string = self.labels[label]
-        image_name = self.images[self.data[i]["image"]]
+        label_id = self.data[i]["label"]
+        label_string = self.labels[label_id]
+
+        image_id = self.data[i]["image"]
+        image_name = self.images[image_id]
         # Sanity check
         # print("n_channels:", len(self.channels), "n_times:", len(self.times))
         # print("times[0], times[-1]:", self.times[0], self.times[-1])
@@ -68,7 +62,7 @@ class EEGDataset:
         # print(i)
 
 
-        if label<1654:
+        if label_id<1654:
             image_path = os.path.join(
                 self.image_dir, "training_images",label_string, image_name
             )
@@ -80,18 +74,14 @@ class EEGDataset:
 
         image_raw = self.processor(images=image_raw, return_tensors="pt", padding=True)
         image_raw["pixel_values"] = image_raw["pixel_values"].squeeze(0)
-        image_id = self.data[i]["image"]
 
-        if self.fine_tuning:
-            return image_raw, eeg, label_string, image_id
-        else:
-            return image_raw, eeg, label, image_id 
+        return image_raw, eeg, label_id, image_id
 
 
 class Splitter:
 
     def __init__(
-        self, dataset, split_path, split_num=0, split_name="train", fine_tuning=False
+        self, dataset, split_path, split_num=0, split_name="train"
     ):
         # Set EEG dataset
         self.dataset = dataset
@@ -100,7 +90,6 @@ class Splitter:
         self.split_idx = loaded["splits"][split_num][split_name]
         # Compute size
         self.size = len(self.split_idx)
-        self.fine_tuning = fine_tuning
         print(f"Total examples in the split {split_name} {self.size}")
 
     # Get size
@@ -110,13 +99,9 @@ class Splitter:
     # Get item
     def __getitem__(self, i):
         # Get sample from dataset
-        if self.fine_tuning:
-            img_data, eeg, label_string = self.dataset[self.split_idx[i]]
-            return img_data, eeg, label_string
-        else:
-            # Preserve image_id so downstream code (train/test) can index precomputed embeddings
-            img_data, eeg, label, image_id = self.dataset[self.split_idx[i]]
-            return img_data, eeg, label, image_id
+        # Preserve image_id so downstream code (train/test) can index precomputed embeddings
+        img_data, eeg, label, image_id = self.dataset[self.split_idx[i]]
+        return img_data, eeg, label, image_id
 
 
 
